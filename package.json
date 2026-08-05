@@ -12,7 +12,11 @@
     "build": "pnpm -r --if-present run build",
     "typecheck": "pnpm -r --if-present run typecheck",
     "test": "vitest run",
-    "test:watch": "vitest"
+    "test:watch": "vitest",
+    "db:migrate": "node database/scripts/sqlite-cli.mjs migrate",
+    "db:seed": "node database/scripts/sqlite-cli.mjs seed",
+    "db:rebuild": "node database/scripts/sqlite-cli.mjs rebuild",
+    "db:verify": "node database/scripts/sqlite-cli.mjs verify"
   },
   "devDependencies": {
     "@types/node": "^26.1.2",
