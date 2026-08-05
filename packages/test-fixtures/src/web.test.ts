@@ -6,11 +6,14 @@ import {
 } from "@crm-agent/contracts";
 import {
   aiOutputInvalidError,
+  clearedConversationSnapshot,
   emptyConversationSnapshot,
   failedEventStream,
   knowledgeInsufficientEventStream,
+  knowledgeInsufficientTurnResult,
   questionRequiredEventStream,
   quoteUnavailableEventStream,
+  quoteUnavailableTurnResult,
   quoteReadyEventStream,
   restoredQuoteConversationSnapshot,
   webStateFixtures,
@@ -27,6 +30,7 @@ const eventStreams = [
 describe("D-01 web state fixtures", () => {
   it("uses only contract-valid conversation snapshots", () => {
     expect(ConversationSnapshotSchema.safeParse(emptyConversationSnapshot).success).toBe(true);
+    expect(ConversationSnapshotSchema.safeParse(clearedConversationSnapshot).success).toBe(true);
     expect(ConversationSnapshotSchema.safeParse(restoredQuoteConversationSnapshot).success).toBe(
       true,
     );
@@ -64,9 +68,40 @@ describe("D-01 web state fixtures", () => {
     expect(ApiErrorSchema.safeParse(aiOutputInvalidError).success).toBe(true);
   });
 
+  it("provides the quote-card fields required by D-01", () => {
+    const quote = restoredQuoteConversationSnapshot.current_quote;
+
+    expect(quote.items.length).toBeGreaterThan(0);
+    expect(quote.estimated_total_fen).toBeGreaterThan(0);
+    expect(quote.rule_versions.length).toBeGreaterThan(0);
+    expect(quote.assumptions.length).toBeGreaterThan(0);
+    expect(quote.disclaimer.length).toBeGreaterThan(0);
+  });
+
+  it("keeps safe degradation distinct from a successful quote", () => {
+    expect(knowledgeInsufficientTurnResult.warnings).toContain("knowledge_insufficient");
+    expect(knowledgeInsufficientTurnResult.quote).toBeNull();
+    expect(quoteUnavailableTurnResult.warnings).toContain("no_active_rule");
+    expect(quoteUnavailableTurnResult.quote).toBeNull();
+  });
+
+  it("represents clearing an existing test conversation", () => {
+    const clearedState = webStateFixtures.cleared;
+
+    expect(clearedState.previousSnapshot.messages.length).toBeGreaterThan(0);
+    expect(clearedState.previousSnapshot.current_quote).not.toBeNull();
+    expect(clearedState.snapshot.conversation.conversation_id).not.toBe(
+      clearedState.previousSnapshot.conversation.conversation_id,
+    );
+    expect(clearedState.snapshot.messages).toEqual([]);
+    expect(clearedState.snapshot.current_quote).toBeNull();
+    expect(clearedState.snapshot.active_turn_id).toBeNull();
+  });
+
   it("provides every page state required by D-01", () => {
     expect(Object.keys(webStateFixtures)).toEqual([
       "empty",
+      "cleared",
       "loading",
       "missingFields",
       "quoteReady",

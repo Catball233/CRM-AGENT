@@ -7,6 +7,7 @@ import type {
 import { ids, validChatTurnResult, validQuoteResult, validUserMessage } from "./contracts";
 
 export const webFixtureIds = {
+  clearedConversation: "eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee",
   questionAssistantMessage: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
   knowledgeAssistantMessage: "cccccccc-cccc-4ccc-8ccc-cccccccccccc",
   quoteUnavailableAssistantMessage: "dddddddd-dddd-4ddd-8ddd-dddddddddddd",
@@ -354,6 +355,21 @@ export const restoredQuoteConversationSnapshot = {
   active_turn_id: null,
 } as const;
 
+export const clearedConversationSnapshot = {
+  contract_version: "1.0.0",
+  conversation: {
+    contract_version: "1.0.0",
+    conversation_id: webFixtureIds.clearedConversation,
+    stage: "DISCOVERY",
+    status: "ACTIVE",
+    created_at: "2026-08-05T06:05:00Z",
+    updated_at: "2026-08-05T06:05:00Z",
+  },
+  messages: [],
+  current_quote: null,
+  active_turn_id: null,
+} as const;
+
 export const networkFailureState = {
   kind: "network_error",
   user_safe_message: "暂时无法连接本地服务，请检查服务状态后重试。",
@@ -362,6 +378,11 @@ export const networkFailureState = {
 
 export const webStateFixtures = {
   empty: { snapshot: emptyConversationSnapshot, events: [] },
+  cleared: {
+    previousSnapshot: restoredQuoteConversationSnapshot,
+    snapshot: clearedConversationSnapshot,
+    events: [],
+  },
   loading: { snapshot: emptyConversationSnapshot, events: quoteReadyEventStream.slice(0, 1) },
   missingFields: { snapshot: emptyConversationSnapshot, events: questionRequiredEventStream },
   quoteReady: { snapshot: restoredQuoteConversationSnapshot, events: quoteReadyEventStream },
