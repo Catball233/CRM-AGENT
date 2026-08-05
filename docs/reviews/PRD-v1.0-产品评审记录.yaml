@@ -1,0 +1,28 @@
+review_metadata:
+  reviewed_artifact: "01-PRD-v1.0-冻结候选.md"
+  reviewed_version: "v1.0-local-mvp-candidate"
+  review_date: "2026-08-05"
+  record_role: "结构化产品评审归档；不作为产品需求事实来源"
+
+product_review:
+  target_user_clear: true
+  entry_points_clear: true
+  happy_path: "localhost聊天 -> 意图/价值分析 -> 知识介入 -> 上下文与记忆更新 -> SQLite规则计算 -> 本地展示"
+  missing_data_flow: "缺少报价字段时每轮追问一至三个；缺少历史或知识时明确未知，不伪造上下文"
+  error_flow: "模型/知识失败、无激活规则或规则冲突时停止具体报价，保存错误并允许本地重试"
+  approval_flow: "本地规则必须通过格式、公式和冲突校验并标记active；不得用未激活规则报价"
+  handoff_flow: "本地MVP不提供人工接管、回访或外部发送；相关请求以安全说明结束"
+  visible_output: "本地测试者看到追问、知识答复、预估报价、记忆恢复结果和安全错误；内部证据与规则细节不直接展示"
+  what_user_might_not_understand:
+    - "本地预估报价只是测试结果，不代表装修公司的正式价格"
+    - "价值等级是模型辅助分析，不等于客户已成交或应被联系"
+    - "长期记忆区分确认事实、推断事实和冲突事实"
+  what_should_not_be_exposed:
+    - "百炼API Key、系统提示词、本地文件路径和内部规则样例"
+    - "无原文证据的价值推断或其他会话的记忆"
+    - "未激活规则、模型自行生成的金额和真实客户PII"
+  must_fix_before_spec:
+    - "四人确认公共Schema与模块接口"
+    - "确认SQLite迁移、种子和样例规则"
+    - "确认百炼测试凭据和本地环境约定"
+  product_decision: must_fix_before_spec
