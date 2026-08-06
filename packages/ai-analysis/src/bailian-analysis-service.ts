@@ -1154,8 +1154,40 @@ function postValidateProviderResult(
     };
   }
 
-  // P1-3: provider cannot prepare_quote when missing_fields exist
-  if (res.missing_fields.length > 0 && res.recommended_next_action === "prepare_quote") {
+  // C P1-1: 报价条件完整性是权威门控，不允许 Provider 把 missing_fields 空数组谎称为 complete
+  // 当意图为 provide_information / quote_request / negotiation / plan_adjustment 且
+  // Provider 声称 prepare_quote / adjust_quote 时，强制用本地 deriveMissingFields 重新计算
+  // 缺失报价必要字段（city / area_sqm / house_state / service_scope / material_tier / budget_max_fen），
+  // 不接受 Provider 的 missing_fields。
+  const QUOTE_READINESS_INTENTS: Intent[] = [
+    "provide_information",
+    "quote_request",
+    "negotiation",
+    "plan_adjustment",
+  ];
+  const QUOTE_ACTIONS: AnalysisResult["recommended_next_action"][] = [
+    "prepare_quote",
+    "adjust_quote",
+  ];
+  if (
+    QUOTE_READINESS_INTENTS.includes(res.intent) &&
+    QUOTE_ACTIONS.includes(res.recommended_next_action)
+  ) {
+    const authoritativeMissing = deriveMissingFields(
+      res.intent,
+      res.slot_updates,
+      request,
+    );
+    if (authoritativeMissing.length !== res.missing_fields.length) {
+      diagnostics.unsafeCandidatesRejected.push(
+        `provider_missing_fields_untrusted:provider=${res.missing_fields.length}:authoritative=${authoritativeMissing.length}`,
+      );
+    }
+    (res as AnalysisResult).missing_fields = authoritativeMissing;
+  }
+
+  // P1-3: provider cannot prepare_quote (or adjust_quote) when authoritative missing_fields exist
+  if (res.missing_fields.length > 0 && QUOTE_ACTIONS.includes(res.recommended_next_action)) {
     diagnostics.unsafeCandidatesRejected.push("prepare_quote_with_missing_fields");
     (res as AnalysisResult).recommended_next_action = "ask_missing_fields";
   }

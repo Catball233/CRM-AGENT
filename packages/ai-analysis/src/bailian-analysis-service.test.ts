@@ -849,11 +849,77 @@ describe("B-03: A 复审第三轮修复", () => {
   });
 });
 
-describe("B-03: C 复审 P1 修复（evidence 类型校验+安全降级）", () => {
+describe("B-03: C 复审 P1 修复（evidence 类型校验+安全降级+quote readiness 权威门控）", () => {
   const analyzer = new RuleBasedAnalyzer();
   const consultingFx = aiMemoryScenarioFixtures.find((f) =>
     f.fixture_id.includes("CONSULTING-NORMAL"),
   )!;
+
+  // C P1-1: 仅补充预算（报价必要字段不完整）时，Provider 不能通过 missing_fields=[] 骗过 prepare_quote
+  // 最小复现：QUALIFYING 阶段、无已有 facts，客户仅发送"预算15万"。
+  it("P1-1: 仅预算15万且 Provider 声称 missing_fields=[] prepare_quote 时，权威门控强制 ask_missing_fields", async () => {
+    const req: Parameters<RuleBasedAnalyzer["analyze"]>[0] = {
+      contract_version: "1.0.0",
+      conversation_id: "00000000-0000-4000-8000-000000000001",
+      turn_id: "00000000-0000-4000-8000-000000000002",
+      current_message: {
+        message_id: "00000000-0000-4000-8000-000000000003",
+        role: "user",
+        content: "预算15万",
+        sequence: 1,
+        created_at: "2026-08-06T10:00:00+08:00",
+      },
+      context: {
+        contract_version: "1.0.0",
+        conversation_id: "00000000-0000-4000-8000-000000000001",
+        stage: "QUALIFYING",
+        confirmed_facts: [],
+        inferred_facts: [],
+        conflicted_facts: [],
+        recent_messages: [],
+        memory_summary: null,
+        current_quote: null,
+        recalled_items: [],
+        built_at: "2026-08-06T10:00:00+08:00",
+      },
+    } as never;
+    const ruleBased = analyzer.analyze(req as never);
+    // RuleBased 基线应满足：missing_fields 非空（至少缺 city/area_sqm）
+    expect(ruleBased.missing_fields.length, "rule-based must report missing fields").toBeGreaterThan(0);
+    expect(ruleBased.missing_fields.some((m) => m.slot === "city"), "rule-based must miss city").toBe(true);
+    expect(ruleBased.missing_fields.some((m) => m.slot === "area_sqm"), "rule-based must miss area_sqm").toBe(true);
+    expect(ruleBased.recommended_next_action, "rule-based next_action should be ask_missing_fields").toBe(
+      "ask_missing_fields",
+    );
+    // Provider 恶意声称：missing_fields=[], prepare_quote
+    const maliciousProvider: AnalysisResult = {
+      ...JSON.parse(JSON.stringify(ruleBased)),
+      intent: "provide_information",
+      missing_fields: [],
+      recommended_next_action: "prepare_quote",
+    };
+    const fake = new FakeModelProvider({
+      analysis: maliciousProvider as never,
+      reply: { contract_version: "1.0.0", text: "ok", cited_evidence_ids: [], question_fields: [] },
+    });
+    const svc = new BailianAnalysisService(fake);
+    const { result, diagnostics } = await svc.analyze(req as never);
+    // 断言：权威门控必须识别出 Provider 的 missing_fields 不可信并强制覆盖
+    expect(
+      diagnostics.unsafeCandidatesRejected.some((r) => r.includes("provider_missing_fields_untrusted")),
+      "diagnostics must record untrusted provider missing_fields",
+    ).toBe(true);
+    // missing_fields 必须回到本地权威计算（至少包含 city、area_sqm）
+    expect(result.missing_fields.length, "authoritative missing_fields must be non-empty").toBeGreaterThan(0);
+    expect(result.missing_fields.some((m) => m.slot === "city"), "authoritative missing must include city").toBe(true);
+    expect(result.missing_fields.some((m) => m.slot === "area_sqm"), "authoritative missing must include area_sqm").toBe(true);
+    // next_action 必须强制 ask_missing_fields，不能是 prepare_quote
+    expect(
+      diagnostics.unsafeCandidatesRejected.some((r) => r.includes("prepare_quote_with_missing_fields")),
+      "diagnostics must record prepare_quote_with_missing_fields override",
+    ).toBe(true);
+    expect(result.recommended_next_action, "next_action must be ask_missing_fields").toBe("ask_missing_fields");
+  });
 
   // C P1-2-1: quote_id 伪装成 message evidence 必须被拒绝
   it("P1-2-1: quote_id 伪装成 source_type=message evidence 被过滤", async () => {
