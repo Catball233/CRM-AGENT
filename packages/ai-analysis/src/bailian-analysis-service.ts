@@ -216,9 +216,9 @@ function deriveStage(
   factsCount: number,
   missingRequired: number,
 ): ConversationStage {
-  if (intent === "risk") return "CLOSED";
-  if (intent === "rejection" || intent === "unrelated") return prevStage === "COMPLETED" ? "COMPLETED" : "CLOSED";
   if (prevStage === "CLOSED" || prevStage === "COMPLETED") return prevStage;
+  if (intent === "risk") return prevStage;
+  if (intent === "rejection" || intent === "unrelated") return prevStage;
   if (intent === "quote_request") {
     if (missingRequired > 2 && factsCount < 4) return "QUALIFYING";
     return "QUOTING";
@@ -328,7 +328,29 @@ function extractSlotUpdates(request: AnalysisRequest): SlotUpdate[] {
   const budget = numericMatch(text, /(\d+)\s*万(?:元)?\s*(?:预算|总价|总预算|最高|最多|上限|以内|控制)?/iu);
   if (budget !== undefined) {
     const fen = budget * 10_000 * 100;
-    if (!slotIsCovered("budget_max_fen", allFacts)) {
+    const existingBudgetFacts = request.context.confirmed_facts.filter(
+      (f) => f.fact_key === "budget_max_fen" && f.status === "confirmed",
+    );
+    if (existingBudgetFacts.length > 0) {
+      const conflicts = existingBudgetFacts.filter((f) => {
+        const factVal = typeof f.value === "number" ? f.value : Number(f.value);
+        return Number.isFinite(factVal) && factVal !== fen;
+      });
+      if (conflicts.length > 0) {
+        const conflictedWith = conflicts.map((f) => f.fact_id);
+        const priorEvidence: SourceRef[] = conflicts.flatMap((f) =>
+          f.source_refs.filter((r) => r.source_type === "message"),
+        );
+        updates.push({
+          slot: "budget_max_fen",
+          value: fen,
+          status: "conflicted",
+          confidence: 0.5,
+          source_refs: [...priorEvidence, ref()],
+          conflicts_with_fact_ids: conflictedWith,
+        });
+      }
+    } else if (!slotIsCovered("budget_max_fen", allFacts)) {
       updates.push({ slot: "budget_max_fen", value: fen, status: "confirmed", source_refs: [ref()] });
     }
   }
@@ -339,8 +361,8 @@ function extractSlotUpdates(request: AnalysisRequest): SlotUpdate[] {
       houseMatch[0]!.includes("旧") || houseMatch[0]!.includes("老") || houseMatch[0]!.includes("二手") || houseMatch[0]!.includes("翻新") || houseMatch[0]!.includes("重装")
         ? "old_renovation"
         : houseMatch[0]!.includes("精装")
-          ? "hardcover_fine"
-          : "new_blank";
+          ? "new_finished"
+          : "rough";
     if (!slotIsCovered("house_state", allFacts)) {
       updates.push({ slot: "house_state", value: v, status: "confirmed", source_refs: [ref()] });
     }
@@ -349,17 +371,11 @@ function extractSlotUpdates(request: AnalysisRequest): SlotUpdate[] {
   const scopeMatch = /(全屋|整装|硬装|软装|半包|全包|局部(改造|装修)?|厨卫翻新|卧室|客厅|厨房|卫生间|阳台)/iu.exec(text);
   if (scopeMatch) {
     const v =
-      scopeMatch[0]!.includes("全屋") || scopeMatch[0]!.includes("整装")
+      scopeMatch[0]!.includes("全屋") || scopeMatch[0]!.includes("整装") || scopeMatch[0]!.includes("全包")
         ? "whole_home"
-        : scopeMatch[0]!.includes("硬装")
-          ? "hard_fit"
-          : scopeMatch[0]!.includes("软装")
-            ? "soft_fit"
-            : scopeMatch[0]!.includes("全包")
-              ? "turnkey"
-              : scopeMatch[0]!.includes("半包")
-                ? "partial_labor"
-                : "partial_scope";
+        : scopeMatch[0]!.includes("设计")
+          ? "design_only"
+          : "partial";
     if (!slotIsCovered("service_scope", allFacts)) {
       updates.push({ slot: "service_scope", value: v, status: "confirmed", source_refs: [ref()] });
     }
@@ -569,7 +585,7 @@ function deriveNextAction(
   if (intent === "quote_request") return "prepare_quote";
   if (intent === "negotiation") return "adjust_quote";
   if (intent === "plan_adjustment") return "adjust_quote";
-  if (intent === "provide_information") return "ask_missing_fields";
+  if (intent === "provide_information") return missing.length > 0 ? "ask_missing_fields" : "prepare_quote";
   if (knowledge.should_search) return "search_knowledge";
   return "answer_question";
 }
@@ -828,6 +844,26 @@ function countEvidenceMessages(result: AnalysisResult): number {
   return count;
 }
 
+function collectVisibleSourceIds(request: AnalysisRequest): Set<string> {
+  const out = new Set<string>();
+  out.add(request.current_message.message_id);
+  for (const m of request.context.recent_messages) out.add(m.message_id);
+  for (const bucket of [
+    request.context.confirmed_facts,
+    request.context.inferred_facts,
+    request.context.conflicted_facts,
+  ] as const) {
+    for (const f of bucket) out.add(f.fact_id);
+  }
+  if (request.context.memory_summary) {
+    out.add(request.context.memory_summary.summary_id);
+    for (const m of request.context.memory_summary.source_message_ids) out.add(m);
+  }
+  if (request.context.current_quote) out.add(request.context.current_quote.quote_id);
+  for (const r of request.context.recalled_items) out.add(r.source_ref.source_id);
+  return out;
+}
+
 function postValidateProviderResult(
   raw: unknown,
   request: AnalysisRequest,
@@ -867,7 +903,7 @@ function postValidateProviderResult(
     }
     (res as AnalysisResult).recommended_next_action = "safe_stop";
     (res as AnalysisResult).intent = "risk";
-    (res as AnalysisResult).stage_recommendation = "CLOSED";
+    (res as AnalysisResult).stage_recommendation = request.context.stage;
     (res as AnalysisResult).value_assessment = {
       level: "unknown",
       evidence_refs: [],
@@ -886,6 +922,28 @@ function postValidateProviderResult(
   if (res.intent === "unclear" && res.recommended_next_action === "prepare_quote") {
     diagnostics.unsafeCandidatesRejected.push("unclear_intent_forbidden_quote_action");
     (res as AnalysisResult).recommended_next_action = "answer_question";
+  }
+
+  // P1-2: filter provider evidence refs to only visible source IDs
+  const visibleIds = collectVisibleSourceIds(request);
+  const allRefArrays = [
+    { refs: (res as AnalysisResult).value_assessment.evidence_refs, label: "value" },
+    ...res.concerns.map((c) => ({ refs: (c as Concern).evidence_refs, label: `concern:${c.code}` })),
+    ...res.safety_flags.map((s) => ({ refs: (s as SafetyFlag).evidence_refs, label: `safety:${s.code}` })),
+    ...res.slot_updates.map((s) => ({ refs: (s as SlotUpdate).source_refs, label: `slot:${s.slot}` })),
+  ];
+  for (const { refs, label } of allRefArrays) {
+    const before = refs.length;
+    (refs as SourceRef[]).splice(0, refs.length, ...refs.filter((r) => visibleIds.has(r.source_id)));
+    if (refs.length < before) {
+      diagnostics.unsafeCandidatesRejected.push(`invisible_evidence_filtered:${label}:${before - refs.length}_removed`);
+    }
+  }
+
+  // P1-3: provider cannot prepare_quote when missing_fields exist
+  if (res.missing_fields.length > 0 && res.recommended_next_action === "prepare_quote") {
+    diagnostics.unsafeCandidatesRejected.push("prepare_quote_with_missing_fields");
+    (res as AnalysisResult).recommended_next_action = "ask_missing_fields";
   }
 
   return res;

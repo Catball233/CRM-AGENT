@@ -325,6 +325,199 @@ describe("B-03: BailianAnalysisService 依赖 provider 与安全兜底", () => {
   });
 });
 
+describe("B-03: C 评审 P1 回归测试", () => {
+  const analyzer = new RuleBasedAnalyzer();
+  const consultingFx = aiMemoryScenarioFixtures.find((f) =>
+    f.fixture_id.includes("CONSULTING-NORMAL"),
+  )!;
+
+  it("P1-1: house_state/service_scope 输出值与 QuoteParameters 公共契约枚举一致", () => {
+    const validHouseStates = ["rough", "new_finished", "old_renovation"];
+    const validServiceScopes = ["whole_home", "partial", "design_only"];
+
+    // house_state: 新房毛坯 → rough
+    const houseReq = {
+      ...consultingFx.analysis_request,
+      current_message: {
+        ...consultingFx.analysis_request.current_message,
+        content: "我家是新房毛坯，想装修",
+      },
+    };
+    const houseRes = analyzer.analyze(houseReq as never);
+    const houseSlot = houseRes.slot_updates.find((s) => s.slot === "house_state");
+    expect(houseSlot).toBeDefined();
+    expect(validHouseStates).toContain(houseSlot!.value);
+
+    // house_state: 精装 → new_finished
+    const fineReq = {
+      ...consultingFx.analysis_request,
+      current_message: {
+        ...consultingFx.analysis_request.current_message,
+        content: "我家是精装房，想翻新",
+      },
+    };
+    const fineRes = analyzer.analyze(fineReq as never);
+    const fineSlot = fineRes.slot_updates.find((s) => s.slot === "house_state");
+    if (fineSlot) expect(validHouseStates).toContain(fineSlot.value);
+
+    // service_scope: 全屋整装 → whole_home
+    const scopeReq = {
+      ...consultingFx.analysis_request,
+      current_message: {
+        ...consultingFx.analysis_request.current_message,
+        content: "我想做全屋整装",
+      },
+    };
+    const scopeRes = analyzer.analyze(scopeReq as never);
+    const scopeSlot = scopeRes.slot_updates.find((s) => s.slot === "service_scope");
+    expect(scopeSlot).toBeDefined();
+    expect(validServiceScopes).toContain(scopeSlot!.value);
+
+    // service_scope: 硬装 → partial
+    const hardReq = {
+      ...consultingFx.analysis_request,
+      current_message: {
+        ...consultingFx.analysis_request.current_message,
+        content: "只想做硬装",
+      },
+    };
+    const hardRes = analyzer.analyze(hardReq as never);
+    const hardSlot = hardRes.slot_updates.find((s) => s.slot === "service_scope");
+    if (hardSlot) expect(validServiceScopes).toContain(hardSlot.value);
+  });
+
+  it("P1-2: Provider 返回不可见 evidence source_id 时被后校验过滤", async () => {
+    const normalResult = analyzer.analyze(consultingFx.analysis_request as never);
+    const fakeInvisibleId = "99999999-9999-4999-8999-999999999999";
+    const providerOutput = {
+      ...JSON.parse(JSON.stringify(normalResult)),
+      value_assessment: {
+        ...normalResult.value_assessment,
+        evidence_refs: [
+          ...normalResult.value_assessment.evidence_refs,
+          { source_type: "message", source_id: fakeInvisibleId, excerpt: "fake" },
+        ],
+      },
+    };
+    const fake = new FakeModelProvider({
+      analysis: providerOutput,
+      reply: { contract_version: "1.0.0", text: "test", cited_evidence_ids: [], question_fields: [] },
+    });
+    const svc = new BailianAnalysisService(fake);
+    const { result, diagnostics } = await svc.analyze(consultingFx.analysis_request as never);
+    const hasInvisible = result.value_assessment.evidence_refs.some(
+      (r) => r.source_id === fakeInvisibleId,
+    );
+    expect(hasInvisible).toBe(false);
+    expect(
+      diagnostics.unsafeCandidatesRejected.some((s) => s.includes("invisible_evidence_filtered")),
+    ).toBe(true);
+  });
+
+  it("P1-3: Provider 返回 prepare_quote 但存在 missing_fields 时被拦截", async () => {
+    const quoteMissingFx = aiMemoryScenarioFixtures.find((f) =>
+      f.fixture_id.includes("QUOTE-MISSING"),
+    )!;
+    const normalResult = analyzer.analyze(quoteMissingFx.analysis_request as never);
+    const providerOutput = {
+      ...JSON.parse(JSON.stringify(normalResult)),
+      recommended_next_action: "prepare_quote",
+      missing_fields: [
+        { slot: "city", reason: "需要先确认是否属于服务区域", priority: 1 },
+      ],
+    };
+    const fake = new FakeModelProvider({
+      analysis: providerOutput,
+      reply: { contract_version: "1.0.0", text: "test", cited_evidence_ids: [], question_fields: [] },
+    });
+    const svc = new BailianAnalysisService(fake);
+    const { result, diagnostics } = await svc.analyze(quoteMissingFx.analysis_request as never);
+    expect(result.recommended_next_action).toBe("ask_missing_fields");
+    expect(
+      diagnostics.unsafeCandidatesRejected.some((s) =>
+        s.includes("prepare_quote_with_missing_fields"),
+      ),
+    ).toBe(true);
+  });
+
+  it("P1-4: provide_information 补齐全部字段后返回 prepare_quote 而非 ask_missing_fields", () => {
+    const msgId = consultingFx.analysis_request.current_message.message_id;
+    const allFieldsConfirmed = [
+      { fact_id: "00000000-0000-4000-8000-000000000001", fact_key: "city", category: "requirement", value: "北京", status: "confirmed", source_refs: [{ source_type: "message" as const, source_id: msgId }], updated_at: "2026-01-01T00:00:00+08:00" },
+      { fact_id: "00000000-0000-4000-8000-000000000002", fact_key: "area_sqm", category: "requirement", value: 100, status: "confirmed", source_refs: [{ source_type: "message" as const, source_id: msgId }], updated_at: "2026-01-01T00:00:00+08:00" },
+      { fact_id: "00000000-0000-4000-8000-000000000003", fact_key: "house_state", category: "requirement", value: "rough", status: "confirmed", source_refs: [{ source_type: "message" as const, source_id: msgId }], updated_at: "2026-01-01T00:00:00+08:00" },
+      { fact_id: "00000000-0000-4000-8000-000000000004", fact_key: "service_scope", category: "requirement", value: "whole_home", status: "confirmed", source_refs: [{ source_type: "message" as const, source_id: msgId }], updated_at: "2026-01-01T00:00:00+08:00" },
+      { fact_id: "00000000-0000-4000-8000-000000000005", fact_key: "material_tier", category: "requirement", value: "mid", status: "confirmed", source_refs: [{ source_type: "message" as const, source_id: msgId }], updated_at: "2026-01-01T00:00:00+08:00" },
+      { fact_id: "00000000-0000-4000-8000-000000000006", fact_key: "budget_max_fen", category: "requirement", value: 15000000, status: "confirmed", source_refs: [{ source_type: "message" as const, source_id: msgId }], updated_at: "2026-01-01T00:00:00+08:00" },
+    ];
+    const request = {
+      ...consultingFx.analysis_request,
+      current_message: {
+        ...consultingFx.analysis_request.current_message,
+        content: "我的预算是15万",
+      },
+      context: {
+        ...consultingFx.analysis_request.context,
+        stage: "QUALIFYING" as const,
+        confirmed_facts: allFieldsConfirmed,
+      },
+    };
+    const result = analyzer.analyze(request as never);
+    expect(result.intent).toBe<Intent>("provide_information");
+    expect(result.missing_fields.length).toBe(0);
+    expect(result.recommended_next_action).toBe("prepare_quote");
+  });
+
+  it("P1-5: 新预算与历史确认预算不一致时标记 conflicted", () => {
+    const msgId = consultingFx.analysis_request.current_message.message_id;
+    const request = {
+      ...consultingFx.analysis_request,
+      current_message: {
+        ...consultingFx.analysis_request.current_message,
+        content: "预算20万",
+      },
+      context: {
+        ...consultingFx.analysis_request.context,
+        stage: "QUOTING" as const,
+        confirmed_facts: [
+          ...consultingFx.analysis_request.context.confirmed_facts,
+          {
+            fact_id: "00000000-0000-4000-8000-0000000000aa",
+            fact_key: "budget_max_fen",
+            category: "requirement",
+            value: 15000000,
+            status: "confirmed",
+            source_refs: [{ source_type: "message" as const, source_id: msgId }],
+            updated_at: "2026-01-01T00:00:00+08:00",
+          },
+        ],
+      },
+    };
+    const result = analyzer.analyze(request as never);
+    const budgetSlot = result.slot_updates.find((s) => s.slot === "budget_max_fen");
+    expect(budgetSlot).toBeDefined();
+    expect(budgetSlot!.status).toBe("conflicted");
+    expect(result.recommended_next_action).toBe("clarify_conflict");
+  });
+
+  it("P1-6: risk/rejection 保持当前 stage，不进入 CLOSED", () => {
+    const injectionFx = aiMemoryScenarioFixtures.find((f) =>
+      f.fixture_id.includes("INJECTION"),
+    )!;
+    const request = {
+      ...injectionFx.analysis_request,
+      context: {
+        ...injectionFx.analysis_request.context,
+        stage: "QUOTING" as const,
+      },
+    };
+    const result = analyzer.analyze(request as never);
+    expect(result.intent).toBe<Intent>("risk");
+    expect(result.stage_recommendation).not.toBe("CLOSED");
+    expect(result.stage_recommendation).toBe("QUOTING");
+  });
+});
+
 function collectVisibleEvidenceIds(fx: AiMemoryScenarioFixture): Set<string> {
   const out = new Set<string>();
   out.add(fx.analysis_request.current_message.message_id);
