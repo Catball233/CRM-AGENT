@@ -275,6 +275,15 @@ export class MessageRepository {
           if (turn.status !== "PROCESSING") {
             throw new Error("retry must transition a FAILED turn back to PROCESSING");
           }
+          const retryability = requiredRow(
+            this.database.prepare(`SELECT failure_retryable FROM turns
+              WHERE turn_id = ? AND conversation_id = ? AND status = 'FAILED'`)
+              .get(persisted.turn_id, turn.conversation_id) as Row | undefined,
+            "failed turn",
+          );
+          if (nullableNumber(retryability, "failure_retryable") !== 1) {
+            throw new Error("TURN_NOT_RETRYABLE: failed turn was marked as non-retryable");
+          }
           assertNoOtherProcessingTurn(this.database, turn.conversation_id, persisted.turn_id);
           const priorAttempt = this.database
             .prepare(`SELECT turn_id FROM turn_retry_attempts

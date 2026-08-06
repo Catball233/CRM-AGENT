@@ -490,6 +490,38 @@ describe("SQLite repositories and transactions", () => {
     }
   });
 
+  it("rejects retries for turns explicitly marked as non-retryable", () => {
+    const database = openMigratedDatabase();
+    try {
+      const repositories = createSqliteRepositories(database);
+      repositories.conversations.create(conversation());
+      const base = processingTurn();
+      repositories.messages.saveTurn(base);
+      expect(repositories.unitOfWork.failTurn({
+        conversation_id: ids.conversation,
+        turn_id: ids.turn,
+        expected_status: "PROCESSING",
+        error_code: "NON_RETRYABLE_FIXTURE_FAILURE",
+        retryable: false,
+      }).status).toBe("FAILED");
+
+      expect(() => repositories.messages.saveTurn({
+        ...base,
+        retry_request_id: otherIds.retryOne,
+      })).toThrow(/TURN_NOT_RETRYABLE/);
+
+      expect(database.prepare(`SELECT status, failure_retryable, attempt_count
+        FROM turns WHERE turn_id = ?`).get(ids.turn)).toEqual({
+        status: "FAILED",
+        failure_retryable: 0,
+        attempt_count: 1,
+      });
+      expect(database.prepare("SELECT COUNT(*) AS count FROM turn_retry_attempts").get()).toEqual({ count: 0 });
+    } finally {
+      database.close();
+    }
+  });
+
   it("rejects cross-conversation fact sources and assistant evidence without partial writes", () => {
     const database = openMigratedDatabase();
     try {
