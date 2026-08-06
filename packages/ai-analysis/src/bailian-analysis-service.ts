@@ -292,21 +292,21 @@ function detectSafety(request: AnalysisRequest): SafetyFlag[] {
     });
   }
 
-  // 4. Fact values (confirmed, inferred, conflicted) — only string values can contain PII
+  // 4. Fact values (confirmed, inferred, conflicted) — scan string and string[] values
   for (const bucket of [
     request.context.confirmed_facts,
     request.context.inferred_facts,
     request.context.conflicted_facts,
   ] as const) {
     for (const fact of bucket) {
-      if (typeof fact.value !== "string") continue;
-      // Use the fact's own source_refs (point to original message)
       const ref: SourceRef = fact.source_refs[0] ?? {
         source_type: "message",
         source_id: request.current_message.message_id,
-        excerpt: fact.value.slice(0, 60),
       };
-      entries.push({ text: fact.value, ref });
+      const values = Array.isArray(fact.value) ? fact.value : [fact.value];
+      for (const v of values) {
+        if (typeof v === "string") entries.push({ text: v, ref });
+      }
     }
   }
 
@@ -315,6 +315,19 @@ function detectSafety(request: AnalysisRequest): SafetyFlag[] {
     entries.push({ text: item.reason, ref: item.source_ref });
     if (item.source_ref.excerpt) {
       entries.push({ text: item.source_ref.excerpt, ref: item.source_ref });
+    }
+  }
+
+  // 6. Source refs excerpts in facts (source_refs[].excerpt can carry PII)
+  for (const bucket of [
+    request.context.confirmed_facts,
+    request.context.inferred_facts,
+    request.context.conflicted_facts,
+  ] as const) {
+    for (const fact of bucket) {
+      for (const sr of fact.source_refs) {
+        if (sr.excerpt) entries.push({ text: sr.excerpt, ref: sr });
+      }
     }
   }
 
@@ -459,7 +472,15 @@ function extractSlotUpdates(request: AnalysisRequest): SlotUpdate[] {
     let value: SlotUpdate["value"];
     let status: SlotUpdate["status"];
     let confidence: number | undefined;
+    // Detect negation context: "别太高档", "不要太高档", "不用高档" etc.
+    const negationPattern = /(别太|不要太|不用|不要|别|不|没那么)/iu;
+    const hasNegation = negationPattern.test(text.slice(0, materialMatch.index ?? 0));
     if (raw.includes("性价比") || raw.includes("经济") || raw.includes("普通")) {
+      value = ["low", "mid"];
+      status = "inferred";
+      confidence = 0.6;
+    } else if (hasNegation && (raw.includes("高档") || raw.includes("高端") || raw.includes("奢华") || raw.includes("豪华"))) {
+      // Negated high-end → inferred low/mid
       value = ["low", "mid"];
       status = "inferred";
       confidence = 0.6;
@@ -541,8 +562,32 @@ function deriveMissingFields(
   slotUpdates: SlotUpdate[],
   request: AnalysisRequest,
 ): MissingField[] {
-  if (intent !== "quote_request" && intent !== "negotiation" && intent !== "plan_adjustment") return [];
-  const covered = new Set(slotUpdates.map((s) => s.slot));
+  if (
+    intent !== "quote_request" &&
+    intent !== "negotiation" &&
+    intent !== "plan_adjustment" &&
+    intent !== "provide_information"
+  )
+    return [];
+
+  // For provide_information: only flag inferred slots that need confirmation,
+  // not all missing required fields (customer is sharing info, not requesting quote)
+  if (intent === "provide_information") {
+    const out: MissingField[] = [];
+    for (const s of slotUpdates) {
+      if (s.status === "inferred") {
+        out.push({ slot: s.slot, reason: priority2Reason(s.slot), priority: 2 });
+      }
+    }
+    return out
+      .sort((a, b) => (a.priority as number) - (b.priority as number))
+      .slice(0, 3);
+  }
+
+  // Only confirmed slots count as covered; inferred slots still need confirmation
+  const covered = new Set(
+    slotUpdates.filter((s) => s.status === "confirmed").map((s) => s.slot),
+  );
   for (const f of request.context.confirmed_facts) {
     if (f.status === "confirmed") covered.add(f.fact_key as SlotUpdate["slot"]);
   }
@@ -1012,13 +1057,30 @@ function postValidateProviderResult(
     }
   }
 
+  // P1-2 fix: if value_assessment level is known but evidence_refs became empty after filtering,
+  // restore with current message ref to satisfy AnalysisResultSchema
+  if (res.value_assessment.level !== "unknown" && res.value_assessment.evidence_refs.length === 0) {
+    diagnostics.unsafeCandidatesRejected.push("value_evidence_empty_after_filter_restore");
+    (res as AnalysisResult).value_assessment.evidence_refs.push(messageRef(request));
+  }
+
   // P1-3: provider cannot prepare_quote when missing_fields exist
   if (res.missing_fields.length > 0 && res.recommended_next_action === "prepare_quote") {
     diagnostics.unsafeCandidatesRejected.push("prepare_quote_with_missing_fields");
     (res as AnalysisResult).recommended_next_action = "ask_missing_fields";
   }
 
-  return res;
+  // P1-2 fix: re-validate against AnalysisResultSchema after all post-validation mutations
+  const revalidation = AnalysisResultSchema.safeParse(res);
+  if (!revalidation.success) {
+    diagnostics.unsafeCandidatesRejected.push(`post_validate_schema_failed:${revalidation.error.issues.length}_issues`);
+    const fallback = new RuleBasedAnalyzer().analyze(request);
+    diagnostics.fallbackApplied = true;
+    diagnostics.fallbackReason = "provider_malformed";
+    return fallback;
+  }
+
+  return revalidation.data;
 }
 
 export {

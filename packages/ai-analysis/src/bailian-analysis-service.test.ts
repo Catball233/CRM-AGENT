@@ -629,6 +629,144 @@ describe("B-03: 复审 P0 历史上下文 PII 不外发", () => {
   });
 });
 
+describe("B-03: C 复审第二轮修复", () => {
+  const analyzer = new RuleBasedAnalyzer();
+
+  // P0: fact.value string[] 中的 PII 不外发
+  it("P0: fact.value 为 string[] 且含手机号时不调用 Provider", async () => {
+    const consultingFx = aiMemoryScenarioFixtures.find((f) =>
+      f.fixture_id.includes("CONSULTING-NORMAL"),
+    )!;
+    const msgId = consultingFx.analysis_request.current_message.message_id;
+    const request = {
+      ...consultingFx.analysis_request,
+      current_message: {
+        ...consultingFx.analysis_request.current_message,
+        content: "设计方案有哪些？",
+      },
+      context: {
+        ...consultingFx.analysis_request.context,
+        confirmed_facts: [
+          ...consultingFx.analysis_request.context.confirmed_facts,
+          {
+            fact_id: "dddddddd-dddd-4ddd-8ddd-dddddddddddd",
+            fact_key: "special_requirements" as const,
+            category: "preference" as const,
+            value: ["请联系13812345678", "需要全屋定制"],
+            status: "confirmed" as const,
+            source_refs: [{ source_type: "message" as const, source_id: msgId, excerpt: "请联系13812345678" }],
+            updated_at: "2026-01-01T00:00:00+08:00",
+          },
+        ],
+      },
+    };
+    const fake = new FakeModelProvider({
+      analysis: analyzer.analyze(consultingFx.analysis_request as never),
+      reply: { contract_version: "1.0.0", text: "test", cited_evidence_ids: [], question_fields: [] },
+    });
+    const svc = new BailianAnalysisService(fake);
+    const { result, diagnostics } = await svc.analyze(request as never);
+    expect(fake.analysisCalls.length).toBe(0);
+    expect(diagnostics.fallbackApplied).toBe(true);
+    expect(diagnostics.fallbackReason).toBe("safety_blocked");
+    expect(result.safety_flags.some((f) => f.code === "pii")).toBe(true);
+    expect(result.recommended_next_action).toBe("safe_stop");
+  });
+
+  // P0: fact source_refs[].excerpt 含 PII 时不外发
+  it("P0: fact source_refs excerpt 含地址时不调用 Provider", async () => {
+    const consultingFx = aiMemoryScenarioFixtures.find((f) =>
+      f.fixture_id.includes("CONSULTING-NORMAL"),
+    )!;
+    const msgId = consultingFx.analysis_request.current_message.message_id;
+    const request = {
+      ...consultingFx.analysis_request,
+      current_message: {
+        ...consultingFx.analysis_request.current_message,
+        content: "设计方案有哪些？",
+      },
+      context: {
+        ...consultingFx.analysis_request.context,
+        confirmed_facts: [
+          ...consultingFx.analysis_request.context.confirmed_facts,
+          {
+            fact_id: "eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee",
+            fact_key: "city" as const,
+            category: "requirement" as const,
+            value: "上海",
+            status: "confirmed" as const,
+            source_refs: [{ source_type: "message" as const, source_id: msgId, excerpt: "我住上海xx路123号" }],
+            updated_at: "2026-01-01T00:00:00+08:00",
+          },
+        ],
+      },
+    };
+    const fake = new FakeModelProvider({
+      analysis: analyzer.analyze(consultingFx.analysis_request as never),
+      reply: { contract_version: "1.0.0", text: "test", cited_evidence_ids: [], question_fields: [] },
+    });
+    const svc = new BailianAnalysisService(fake);
+    const { result, diagnostics } = await svc.analyze(request as never);
+    expect(fake.analysisCalls.length).toBe(0);
+    expect(diagnostics.fallbackReason).toBe("safety_blocked");
+    expect(result.safety_flags.some((f) => f.code === "pii")).toBe(true);
+  });
+
+  // P1: 后校验过滤不可见 evidence 后重新 Schema 校验
+  it("P1: Provider 返回全部不可见 evidence refs 时回退到规则引擎", async () => {
+    const consultingFx = aiMemoryScenarioFixtures.find((f) =>
+      f.fixture_id.includes("CONSULTING-NORMAL"),
+    )!;
+    const analyzerResult = analyzer.analyze(consultingFx.analysis_request as never);
+    // Return result with only invisible source IDs
+    const providerResult = {
+      ...analyzerResult,
+      value_assessment: {
+        ...analyzerResult.value_assessment,
+        evidence_refs: [
+          { source_type: "message", source_id: "ffffffff-ffff-4fff-8fff-ffffffffffff", excerpt: "test" },
+        ],
+      },
+    };
+    const fake = new FakeModelProvider({
+      analysis: providerResult as never,
+      reply: { contract_version: "1.0.0", text: "test", cited_evidence_ids: [], question_fields: [] },
+    });
+    const svc = new BailianAnalysisService(fake);
+    const { diagnostics } = await svc.analyze(consultingFx.analysis_request as never);
+    // Should have filtered invisible evidence and restored or fallen back
+    expect(diagnostics.unsafeCandidatesRejected.some((r) => r.includes("invisible_evidence_filtered"))).toBe(true);
+  });
+
+  // P1: B-01-INFERRED-MATERIAL-PREFERENCE 逐项断言
+  it("P1: INFERRED-MATERIAL-PREFERENCE 否定语境正确识别为 low/mid inferred", () => {
+    const fx = aiMemoryScenarioFixtures.find((f) =>
+      f.fixture_id === "B-01-INFERRED-MATERIAL-PREFERENCE",
+    )!;
+    const result = analyzer.analyze(fx.analysis_request as never);
+
+    // intent
+    expect(result.intent, "intent").toBe(fx.annotation.expected.intent);
+    // value_level
+    expect(result.value_assessment.level, "value_level").toBe(fx.annotation.expected.value_level);
+    // next_action
+    expect(result.recommended_next_action, "next_action").toBe(fx.annotation.expected.next_action);
+    // safety_codes
+    const safetyCodes = result.safety_flags.map((s) => s.code);
+    expect(safetyCodes, "safety_codes").toEqual(fx.annotation.expected.safety_codes);
+    // slot_updates
+    const slotNames = result.slot_updates.map((s) => s.slot);
+    expect(slotNames, "slot_updates").toEqual(fx.annotation.expected.slot_updates);
+    // material_tier 应为 inferred low/mid
+    const materialSlot = result.slot_updates.find((s) => s.slot === "material_tier");
+    expect(materialSlot?.status, "material_tier status").toBe("inferred");
+    expect(materialSlot?.value, "material_tier value").toEqual(["low", "mid"]);
+    // missing_fields
+    const missingSlots = result.missing_fields.map((m) => m.slot);
+    expect(missingSlots, "missing_fields").toEqual(fx.annotation.expected.missing_fields);
+  });
+});
+
 function collectVisibleEvidenceIds(fx: AiMemoryScenarioFixture): Set<string> {
   const out = new Set<string>();
   out.add(fx.analysis_request.current_message.message_id);
