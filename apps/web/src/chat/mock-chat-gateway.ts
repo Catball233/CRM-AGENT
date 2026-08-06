@@ -119,6 +119,7 @@ function splitResponse(response: string) {
 
 export class MockChatGateway implements ChatGateway {
   private readonly delayMs: number;
+  private readonly conversationGenerations = new Map<string, number>();
 
   constructor(
     private readonly storage: Storage,
@@ -147,6 +148,7 @@ export class MockChatGateway implements ChatGateway {
     const store = this.readStore();
     store.conversations[conversation.conversation_id] = snapshot;
     this.writeStore(store);
+    this.conversationGenerations.set(conversation.conversation_id, 0);
     return conversation;
   }
 
@@ -159,6 +161,7 @@ export class MockChatGateway implements ChatGateway {
   }
 
   async deleteConversation(conversationId: string): Promise<void> {
+    this.advanceGeneration(conversationId);
     const store = this.readStore();
     delete store.conversations[conversationId];
     this.writeStore(store);
@@ -170,6 +173,7 @@ export class MockChatGateway implements ChatGateway {
   ): AsyncIterable<ChatEvent> {
     const request = SendMessageRequestSchema.parse(candidate);
     const snapshot = await this.getConversation(conversationId);
+    const generation = this.advanceGeneration(conversationId);
     const scenario = chooseScenario(request.content);
     const turnId = createId();
     const assistantMessageId = createId();
@@ -262,21 +266,32 @@ export class MockChatGateway implements ChatGateway {
       }
       if (event.event_type === "turn.completed") {
         const currentStore = this.readStore();
-        currentStore.conversations[conversationId] = ConversationSnapshotSchema.parse({
-          contract_version: "1.0.0",
-          conversation: {
-            ...snapshot.conversation,
-            stage: scenario.stage,
-            updated_at: now,
-          },
-          messages: [...snapshot.messages, result.user_message, result.assistant_message],
-          current_quote: null,
-          active_turn_id: null,
-        });
-        this.writeStore(currentStore);
+        if (
+          currentStore.conversations[conversationId] &&
+          this.conversationGenerations.get(conversationId) === generation
+        ) {
+          currentStore.conversations[conversationId] = ConversationSnapshotSchema.parse({
+            contract_version: "1.0.0",
+            conversation: {
+              ...snapshot.conversation,
+              stage: scenario.stage,
+              updated_at: now,
+            },
+            messages: [...snapshot.messages, result.user_message, result.assistant_message],
+            current_quote: null,
+            active_turn_id: null,
+          });
+          this.writeStore(currentStore);
+        }
       }
       yield event;
     }
+  }
+
+  private advanceGeneration(conversationId: string) {
+    const generation = (this.conversationGenerations.get(conversationId) ?? 0) + 1;
+    this.conversationGenerations.set(conversationId, generation);
+    return generation;
   }
 
   private readStore(): MockStore {

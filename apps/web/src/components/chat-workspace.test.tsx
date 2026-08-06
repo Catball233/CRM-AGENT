@@ -13,6 +13,7 @@ import type {
 } from "../chat/chat-gateway";
 import { ChatGatewayError } from "../chat/chat-gateway";
 import { MockChatGateway } from "../chat/mock-chat-gateway";
+import { saveSessionIndex } from "../chat/session-index";
 import { ChatWorkspace } from "./chat-workspace";
 
 afterEach(() => cleanup());
@@ -83,6 +84,49 @@ describe("D-02 chat workspace", () => {
     expect(screen.getByText("等待新消息")).toBeInTheDocument();
   });
 
+  it("keeps the latest conversation selected when restores finish out of order", async () => {
+    class DelayedRestoreGateway extends MockChatGateway {
+      readonly delays = new Map<string, number>();
+
+      override async getConversation(id: string): Promise<ConversationSnapshot> {
+        const delay = this.delays.get(id) ?? 0;
+        if (delay > 0) await new Promise((resolve) => setTimeout(resolve, delay));
+        return super.getConversation(id);
+      }
+    }
+
+    const gateway = new DelayedRestoreGateway(window.localStorage, { delayMs: 0 });
+    const first = await gateway.createConversation();
+    const second = await gateway.createConversation();
+    saveSessionIndex(window.localStorage, {
+      activeConversationId: second.conversation_id,
+      conversations: [
+        {
+          conversationId: second.conversation_id,
+          title: "第二个测试会话",
+          updatedAt: second.updated_at,
+        },
+        {
+          conversationId: first.conversation_id,
+          title: "第一个测试会话",
+          updatedAt: first.updated_at,
+        },
+      ],
+    });
+    render(<ChatWorkspace gateway={gateway} />);
+    const firstButton = await screen.findByRole("button", { name: /第一个测试会话/ });
+    const secondButton = screen.getByRole("button", { name: /第二个测试会话/ });
+    await waitFor(() => expect(secondButton).toHaveClass("active"));
+    gateway.delays.set(first.conversation_id, 40);
+
+    fireEvent.click(firstButton);
+    fireEvent.click(secondButton);
+
+    await new Promise((resolve) => setTimeout(resolve, 60));
+    expect(secondButton).toHaveClass("active");
+    expect(firstButton).not.toHaveClass("active");
+  });
+
   it("requires confirmation before clearing a local test session", async () => {
     const user = userEvent.setup();
     render(<ChatWorkspace gateway={createGateway()} />);
@@ -94,6 +138,41 @@ describe("D-02 chat workspace", () => {
 
     expect(await screen.findByText("让装修需求，从一句话开始")).toBeInTheDocument();
     expect(screen.getByText("还没有本地测试会话")).toBeInTheDocument();
+  });
+
+  it("rejects a send attempt while clear confirmation is open and never restores the session", async () => {
+    class CountingGateway extends MockChatGateway {
+      sendCalls = 0;
+
+      override async *sendMessage(
+        id: string,
+        request: SendMessageRequest,
+      ): AsyncIterable<ChatEvent> {
+        this.sendCalls += 1;
+        for await (const event of super.sendMessage(id, request)) yield event;
+      }
+    }
+
+    const gateway = new CountingGateway(window.localStorage, { delayMs: 5 });
+    const user = userEvent.setup();
+    render(<ChatWorkspace gateway={gateway} />);
+    await createSession(user);
+    await user.type(screen.getByLabelText("输入装修需求"), "清空竞态回归测试");
+    const form = screen.getByRole("button", { name: "发送消息" }).closest("form");
+
+    await user.click(screen.getByRole("button", { name: "清空当前会话" }));
+    expect(screen.getByRole("dialog", { name: "清空当前测试会话？" })).toBeInTheDocument();
+    expect(screen.getByLabelText("输入装修需求")).toBeDisabled();
+    expect(form).not.toBeNull();
+    fireEvent.submit(form!);
+    expect(gateway.sendCalls).toBe(0);
+    await user.click(screen.getByRole("button", { name: "确认清空" }));
+
+    expect(await screen.findByText("让装修需求，从一句话开始")).toBeInTheDocument();
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    expect(screen.queryByText("清空竞态回归测试")).not.toBeInTheDocument();
+    expect(JSON.parse(window.localStorage.getItem("crm-agent.d02.mock-gateway.v1") ?? "{}"))
+      .toEqual({ conversations: {} });
   });
 
   it("returns to the empty state after clearing while retaining other recent sessions", async () => {

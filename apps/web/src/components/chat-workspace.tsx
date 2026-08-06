@@ -118,6 +118,8 @@ export function ChatWorkspace({ gateway: providedGateway }: ChatWorkspaceProps) 
   const messageEndRef = useRef<HTMLDivElement>(null);
   const createInFlightRef = useRef(false);
   const sendInFlightRef = useRef(false);
+  const clearDialogOpenRef = useRef(false);
+  const restoreRequestRef = useRef(0);
 
   useEffect(() => {
     const browserStorage = getBrowserStorage();
@@ -135,20 +137,23 @@ export function ChatWorkspace({ gateway: providedGateway }: ChatWorkspaceProps) 
 
   const restoreConversation = useCallback(
     async (conversationId: string, targetGateway = gateway) => {
-      if (!targetGateway || !storage) return;
+      if (!targetGateway || !storage || clearDialogOpenRef.current) return;
+      const requestId = ++restoreRequestRef.current;
       setStatus("loading");
       setError(null);
       setAnalysis(null);
       try {
         const nextSnapshot = await targetGateway.getConversation(conversationId);
+        if (requestId !== restoreRequestRef.current) return;
         setSnapshot(nextSnapshot);
         const index = loadSessionIndex(storage);
         persistIndex({ ...index, activeConversationId: conversationId });
       } catch (restoreError) {
+        if (requestId !== restoreRequestRef.current) return;
         setSnapshot(null);
         setError(getSafeErrorMessage(restoreError));
       } finally {
-        setStatus("ready");
+        if (requestId === restoreRequestRef.current) setStatus("ready");
       }
     },
     [gateway, persistIndex, storage],
@@ -173,12 +178,14 @@ export function ChatWorkspace({ gateway: providedGateway }: ChatWorkspaceProps) 
     if (
       !gateway ||
       !storage ||
-      status === "sending" ||
+      status !== "ready" ||
+      clearDialogOpenRef.current ||
       createInFlightRef.current
     ) {
       return;
     }
     createInFlightRef.current = true;
+    restoreRequestRef.current += 1;
     setStatus("loading");
     setError(null);
     setAnalysis(null);
@@ -208,7 +215,8 @@ export function ChatWorkspace({ gateway: providedGateway }: ChatWorkspaceProps) 
       !snapshot ||
       !storage ||
       !content ||
-      status === "sending" ||
+      status !== "ready" ||
+      clearDialogOpenRef.current ||
       sendInFlightRef.current
     ) {
       return;
@@ -284,9 +292,29 @@ export function ChatWorkspace({ gateway: providedGateway }: ChatWorkspaceProps) 
     }
   };
 
+  const openClearDialog = () => {
+    if (!snapshot || status !== "ready" || sendInFlightRef.current) return;
+    clearDialogOpenRef.current = true;
+    setClearDialogOpen(true);
+  };
+
+  const closeClearDialog = () => {
+    clearDialogOpenRef.current = false;
+    setClearDialogOpen(false);
+  };
+
   const clearConversation = useCallback(async () => {
-    if (!gateway || !snapshot || !storage) return;
+    if (
+      !gateway ||
+      !snapshot ||
+      !storage ||
+      status !== "ready" ||
+      sendInFlightRef.current
+    ) {
+      return;
+    }
     const conversationId = snapshot.conversation.conversation_id;
+    restoreRequestRef.current += 1;
     setClearDialogOpen(false);
     setStatus("loading");
     setError(null);
@@ -298,6 +326,7 @@ export function ChatWorkspace({ gateway: providedGateway }: ChatWorkspaceProps) 
       );
       persistIndex(nextIndex);
       setAnalysis(null);
+      setDraft("");
       if (nextIndex.activeConversationId) {
         await restoreConversation(nextIndex.activeConversationId, gateway);
       } else {
@@ -306,11 +335,14 @@ export function ChatWorkspace({ gateway: providedGateway }: ChatWorkspaceProps) 
     } catch (clearError) {
       setError(getSafeErrorMessage(clearError));
     } finally {
+      clearDialogOpenRef.current = false;
       setStatus("ready");
     }
-  }, [gateway, persistIndex, restoreConversation, snapshot, storage]);
+  }, [gateway, persistIndex, restoreConversation, snapshot, status, storage]);
 
   const isBusy = status === "booting" || status === "loading" || status === "sending";
+  const interactionLocked = isBusy || clearDialogOpen;
+  const sessionSwitchLocked = status === "booting" || status === "sending" || clearDialogOpen;
   const sessionId = snapshot?.conversation.conversation_id;
   const shortSessionId = sessionId ? sessionId.slice(0, 8) : "未创建";
   const currentStage = snapshot ? STAGE_LABELS[snapshot.conversation.stage] : "等待会话";
@@ -348,7 +380,7 @@ export function ChatWorkspace({ gateway: providedGateway }: ChatWorkspaceProps) 
         className={`session-panel ${sessionPanelOpen ? "mobile-open" : ""}`}
         aria-label="测试会话"
       >
-        <button className="primary-action" type="button" onClick={() => void createConversation()} disabled={isBusy}>
+        <button className="primary-action" type="button" onClick={() => void createConversation()} disabled={interactionLocked}>
           <span aria-hidden="true">＋</span> 新建测试会话
         </button>
         <div className="panel-heading">
@@ -368,7 +400,7 @@ export function ChatWorkspace({ gateway: providedGateway }: ChatWorkspaceProps) 
                   void restoreConversation(conversation.conversationId);
                   setSessionPanelOpen(false);
                 }}
-                disabled={isBusy}
+                disabled={sessionSwitchLocked}
               >
                 <span className="session-icon" aria-hidden="true">◇</span>
                 <span>
@@ -387,8 +419,8 @@ export function ChatWorkspace({ gateway: providedGateway }: ChatWorkspaceProps) 
           <button
             type="button"
             className="danger-action"
-            disabled={!snapshot || isBusy}
-            onClick={() => setClearDialogOpen(true)}
+            disabled={!snapshot || interactionLocked}
+            onClick={openClearDialog}
           >
             清空当前会话
           </button>
@@ -482,14 +514,14 @@ export function ChatWorkspace({ gateway: providedGateway }: ChatWorkspaceProps) 
             value={draft}
             onChange={(event) => setDraft(event.target.value)}
             onKeyDown={handleComposerKeyDown}
-            disabled={!snapshot || isBusy}
+            disabled={!snapshot || interactionLocked}
             maxLength={8000}
             rows={2}
           />
           <button
             type="submit"
             className="send-button"
-            disabled={!snapshot || isBusy || draft.trim().length === 0}
+            disabled={!snapshot || interactionLocked || draft.trim().length === 0}
             aria-label="发送消息"
           >
             <span aria-hidden="true">↑</span>
@@ -544,8 +576,8 @@ export function ChatWorkspace({ gateway: providedGateway }: ChatWorkspaceProps) 
             <h2 id="clear-dialog-title">清空当前测试会话？</h2>
             <p>这会删除该会话在浏览器中的模拟消息，操作无法撤销。</p>
             <div className="dialog-actions">
-              <button type="button" onClick={() => setClearDialogOpen(false)}>取消</button>
-              <button type="button" className="danger-confirm" onClick={() => void clearConversation()}>确认清空</button>
+              <button type="button" onClick={closeClearDialog} disabled={isBusy}>取消</button>
+              <button type="button" className="danger-confirm" onClick={() => void clearConversation()} disabled={isBusy}>确认清空</button>
             </div>
           </section>
         </div>
