@@ -249,18 +249,90 @@ function requiredQuoteSlots(slot: SlotUpdate["slot"]): 1 | 2 | 3 {
 }
 
 function detectSafety(request: AnalysisRequest): SafetyFlag[] {
-  const text = request.current_message.content;
   const out: SafetyFlag[] = [];
-  for (const rule of SAFETY_RULES) {
-    if (rule.pattern.test(text)) {
-      const excerpt = excerptFrom(text, rule.pattern);
-      out.push({
-        code: rule.code,
-        severity: rule.severity,
-        evidence_refs: [messageRef(request, excerpt ? new RegExp(excerpt, "iu") : undefined)],
-      });
+  const seenRules = new Set<string>();
+
+  // Collect all text snippets that would be serialized and sent to Provider,
+  // paired with their source references.
+  type TextEntry = { text: string; ref: SourceRef };
+  const entries: TextEntry[] = [];
+
+  // 1. Current message
+  entries.push({
+    text: request.current_message.content,
+    ref: {
+      source_type: "message",
+      source_id: request.current_message.message_id,
+      excerpt: request.current_message.content.slice(0, 60),
+    },
+  });
+
+  // 2. Recent messages (excluding current message)
+  for (const msg of request.context.recent_messages) {
+    if (msg.message_id === request.current_message.message_id) continue;
+    entries.push({
+      text: msg.content,
+      ref: {
+        source_type: "message",
+        source_id: msg.message_id,
+        excerpt: msg.content.slice(0, 60),
+      },
+    });
+  }
+
+  // 3. Memory summary text
+  if (request.context.memory_summary) {
+    entries.push({
+      text: request.context.memory_summary.text,
+      ref: {
+        source_type: "memory_summary",
+        source_id: request.context.memory_summary.summary_id,
+        excerpt: request.context.memory_summary.text.slice(0, 60),
+      },
+    });
+  }
+
+  // 4. Fact values (confirmed, inferred, conflicted) — only string values can contain PII
+  for (const bucket of [
+    request.context.confirmed_facts,
+    request.context.inferred_facts,
+    request.context.conflicted_facts,
+  ] as const) {
+    for (const fact of bucket) {
+      if (typeof fact.value !== "string") continue;
+      // Use the fact's own source_refs (point to original message)
+      const ref: SourceRef = fact.source_refs[0] ?? {
+        source_type: "message",
+        source_id: request.current_message.message_id,
+        excerpt: fact.value.slice(0, 60),
+      };
+      entries.push({ text: fact.value, ref });
     }
   }
+
+  // 5. Recalled items reasons and excerpts
+  for (const item of request.context.recalled_items) {
+    entries.push({ text: item.reason, ref: item.source_ref });
+    if (item.source_ref.excerpt) {
+      entries.push({ text: item.source_ref.excerpt, ref: item.source_ref });
+    }
+  }
+
+  // Scan all entries against safety rules (deduplicate by rule code)
+  for (const { text, ref } of entries) {
+    for (const rule of SAFETY_RULES) {
+      if (seenRules.has(rule.code)) continue;
+      if (rule.pattern.test(text)) {
+        out.push({
+          code: rule.code,
+          severity: rule.severity,
+          evidence_refs: [ref],
+        });
+        seenRules.add(rule.code);
+      }
+    }
+  }
+
   return out;
 }
 

@@ -518,6 +518,117 @@ describe("B-03: C 评审 P1 回归测试", () => {
   });
 });
 
+describe("B-03: 复审 P0 历史上下文 PII 不外发", () => {
+  const analyzer = new RuleBasedAnalyzer();
+  const consultingFx = aiMemoryScenarioFixtures.find((f) =>
+    f.fixture_id.includes("CONSULTING-NORMAL"),
+  )!;
+  const msgId = consultingFx.analysis_request.current_message.message_id;
+
+  it("P0: recent_messages 含手机号时不调用 Provider", async () => {
+    const request = {
+      ...consultingFx.analysis_request,
+      current_message: {
+        ...consultingFx.analysis_request.current_message,
+        content: "设计方案有哪些？",
+      },
+      context: {
+        ...consultingFx.analysis_request.context,
+        recent_messages: [
+          ...consultingFx.analysis_request.context.recent_messages,
+          {
+            message_id: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+            role: "user" as const,
+            content: "我的手机号是13812345678，可以联系我",
+            sequence: 99,
+            created_at: "2026-01-01T00:00:00+08:00",
+          },
+        ],
+      },
+    };
+    const fake = new FakeModelProvider({
+      analysis: analyzer.analyze(consultingFx.analysis_request as never),
+      reply: { contract_version: "1.0.0", text: "test", cited_evidence_ids: [], question_fields: [] },
+    });
+    const svc = new BailianAnalysisService(fake);
+    const { result, diagnostics } = await svc.analyze(request as never);
+    expect(fake.analysisCalls.length).toBe(0);
+    expect(diagnostics.fallbackApplied).toBe(true);
+    expect(diagnostics.fallbackReason).toBe("safety_blocked");
+    expect(result.safety_flags.some((f) => f.code === "pii")).toBe(true);
+    expect(result.recommended_next_action).toBe("safe_stop");
+  });
+
+  it("P0: memory_summary.text 含地址时不调用 Provider", async () => {
+    const request = {
+      ...consultingFx.analysis_request,
+      current_message: {
+        ...consultingFx.analysis_request.current_message,
+        content: "设计方案有哪些？",
+      },
+      context: {
+        ...consultingFx.analysis_request.context,
+        memory_summary: {
+          summary_id: "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb",
+          version: 1,
+          text: "客户之前提到住在上海xx路123号，需要全屋装修",
+          covers_sequence_from: 1,
+          covers_sequence_to: 5,
+          source_message_ids: [msgId],
+          created_at: "2026-01-01T00:00:00+08:00",
+        },
+      },
+    };
+    const fake = new FakeModelProvider({
+      analysis: analyzer.analyze(consultingFx.analysis_request as never),
+      reply: { contract_version: "1.0.0", text: "test", cited_evidence_ids: [], question_fields: [] },
+    });
+    const svc = new BailianAnalysisService(fake);
+    const { result, diagnostics } = await svc.analyze(request as never);
+    expect(fake.analysisCalls.length).toBe(0);
+    expect(diagnostics.fallbackApplied).toBe(true);
+    expect(diagnostics.fallbackReason).toBe("safety_blocked");
+    expect(result.safety_flags.some((f) => f.code === "pii")).toBe(true);
+    expect(result.recommended_next_action).toBe("safe_stop");
+  });
+
+  it("P0: fact value 含手机号时不调用 Provider", async () => {
+    const request = {
+      ...consultingFx.analysis_request,
+      current_message: {
+        ...consultingFx.analysis_request.current_message,
+        content: "设计方案有哪些？",
+      },
+      context: {
+        ...consultingFx.analysis_request.context,
+        confirmed_facts: [
+          ...consultingFx.analysis_request.context.confirmed_facts,
+          {
+            fact_id: "cccccccc-cccc-4ccc-8ccc-cccccccccccc",
+            fact_key: "preference" as const,
+            category: "preference" as const,
+            value: "客户手机13812345678方便联系",
+            status: "confirmed" as const,
+            source_refs: [{ source_type: "message" as const, source_id: msgId }],
+            updated_at: "2026-01-01T00:00:00+08:00",
+          },
+        ],
+      },
+    };
+    const fake = new FakeModelProvider({
+      analysis: analyzer.analyze(consultingFx.analysis_request as never),
+      reply: { contract_version: "1.0.0", text: "test", cited_evidence_ids: [], question_fields: [] },
+    });
+    const svc = new BailianAnalysisService(fake);
+    const { result, diagnostics } = await svc.analyze(request as never);
+    expect(fake.analysisCalls.length).toBe(0);
+    expect(diagnostics.fallbackApplied).toBe(true);
+    expect(diagnostics.fallbackReason).toBe("safety_blocked");
+    expect(result.safety_flags.some((f) => f.code === "pii")).toBe(true);
+    expect(result.recommended_next_action).toBe("safe_stop");
+  });
+});
+
 function collectVisibleEvidenceIds(fx: AiMemoryScenarioFixture): Set<string> {
   const out = new Set<string>();
   out.add(fx.analysis_request.current_message.message_id);
