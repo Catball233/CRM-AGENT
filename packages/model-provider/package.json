@@ -1,5 +1,5 @@
 {
-  "name": "@crm-agent/test-fixtures",
+  "name": "@crm-agent/model-provider",
   "version": "0.1.0",
   "private": true,
   "main": "dist/index.js",
@@ -16,9 +16,13 @@
     "typecheck": "tsc --noEmit"
   },
   "dependencies": {
-    "@crm-agent/contracts": "workspace:*"
+    "@crm-agent/contracts": "workspace:*",
+    "zod": "^4.4.3"
   },
   "devDependencies": {
-    "typescript": "^7.0.2"
+    "@crm-agent/test-fixtures": "workspace:*",
+    "@types/node": "^26.1.2",
+    "typescript": "^7.0.2",
+    "vitest": "^4.1.10"
   }
 }
