@@ -22,6 +22,16 @@ const expectedFixtureIds = [
   "B-01-PROMPT-INJECTION",
 ] as const;
 
+const expectedStageRecommendations = [
+  ["B-01-CONSULTING-NORMAL", "DISCOVERY"],
+  ["B-01-QUOTE-MISSING-CITY", "QUALIFYING"],
+  ["B-01-UNCLEAR-MISSING-CONTEXT", "DISCOVERY"],
+  ["B-01-INFERRED-MATERIAL-PREFERENCE", "QUALIFYING"],
+  ["B-01-BUDGET-CONFLICT", "QUALIFYING"],
+  ["B-01-LONG-TERM-RECALL", "DISCOVERY"],
+  ["B-01-PROMPT-INJECTION", "CLOSED"],
+] as const satisfies ReadonlyArray<readonly [(typeof expectedFixtureIds)[number], ConversationStage]>;
+
 const entityConversationIds = new Map<string, string>();
 for (const ids of Object.values(aiMemoryIds)) {
   for (const entityId of Object.values(ids)) {
@@ -174,23 +184,12 @@ describe("B-01 AI and memory fixtures", () => {
     }
   });
 
-  it("keeps stage recommendations within the approved state machine", () => {
-    const allowedTransitions: Record<ConversationStage, readonly ConversationStage[]> = {
-      DISCOVERY: ["DISCOVERY", "QUALIFYING", "CLOSED"],
-      QUALIFYING: ["QUALIFYING", "QUOTING", "CLOSED"],
-      QUOTING: ["NEGOTIATION", "COMPLETED", "QUALIFYING", "CLOSED"],
-      NEGOTIATION: ["NEGOTIATION", "QUOTING", "COMPLETED", "CLOSED"],
-      COMPLETED: ["DISCOVERY", "NEGOTIATION", "CLOSED"],
-      CLOSED: [],
-    } as const;
+  it("locks the expected stage annotation for each B-01 fixture", () => {
+    for (const [fixtureId, expectedStage] of expectedStageRecommendations) {
+      const fixture = aiMemoryScenarioFixtures.find((item) => item.fixture_id === fixtureId);
 
-    for (const fixture of aiMemoryScenarioFixtures) {
-      expect(
-        allowedTransitions[fixture.analysis_request.context.stage].includes(
-          fixture.expected_analysis.stage_recommendation,
-        ),
-        fixture.fixture_id,
-      ).toBe(true);
+      expect(fixture, fixtureId).toBeDefined();
+      expect(fixture?.expected_analysis.stage_recommendation, fixtureId).toBe(expectedStage);
     }
   });
 
