@@ -7,3 +7,7 @@ real customer data, supplier identity, negotiated wholesale price, or production
 Its matching evidence, guardrail, supplier snapshot, promotion, and reconciliation fixtures are
 constructed by the integration test so that every activation decision remains deterministic and
 auditable.
+
+`c05-manual-reconciliation.json` records the fictional, integer-fen C-05 calculation that is
+independently asserted by the deterministic quote engine integration test. It contains no real
+commercial rate, customer record, supplier identity, or negotiated price.

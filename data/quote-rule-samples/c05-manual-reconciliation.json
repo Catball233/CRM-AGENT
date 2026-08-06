@@ -1,0 +1,20 @@
+{
+  "fixture_id": "C05-MANUAL-RECONCILIATION-001",
+  "description": "虚构的 80 平方米标准设计与低意向现金优惠对账样例",
+  "amount_unit": "fen",
+  "area_sqm": 80,
+  "unit_price_fen": 13750,
+  "unit_cost_fen": 9900,
+  "minimum_margin_bps": 2000,
+  "maximum_discount_bps": 1500,
+  "promotion_discount_bps": 1000,
+  "expected": {
+    "revenue_subtotal_fen": 1100000,
+    "total_cost_fen": 792000,
+    "floor_revenue_fen": 990000,
+    "rule_discount_cap_fen": 165000,
+    "margin_headroom_fen": 110000,
+    "approved_discount_fen": 110000,
+    "final_revenue_fen": 990000
+  }
+}
