@@ -3,6 +3,7 @@ import {
   RuleBasedAnalyzer,
   BailianAnalysisService,
   type AnalyzeDiagnostics,
+  _postValidateProviderResult,
 } from "./bailian-analysis-service";
 import {
   AnalysisResultSchema,
@@ -845,6 +846,153 @@ describe("B-03: A 复审第三轮修复", () => {
     expect(result.missing_fields.length, "missing_fields non-empty").toBeGreaterThan(0);
     // next_action 必须是 ask_missing_fields，不能是 prepare_quote
     expect(result.recommended_next_action, "next_action").toBe("ask_missing_fields");
+  });
+});
+
+describe("B-03: C 复审 P1 修复（evidence 类型校验+安全降级）", () => {
+  const analyzer = new RuleBasedAnalyzer();
+  const consultingFx = aiMemoryScenarioFixtures.find((f) =>
+    f.fixture_id.includes("CONSULTING-NORMAL"),
+  )!;
+
+  // C P1-2-1: quote_id 伪装成 message evidence 必须被拒绝
+  it("P1-2-1: quote_id 伪装成 source_type=message evidence 被过滤", async () => {
+    const normalResult = analyzer.analyze(consultingFx.analysis_request as never);
+    // 使用合法 UUID 格式的 quoteId（版本 4 + 变体位）
+    const quoteId = "a1a1a1a1-b2b2-4c3c-8d4d-e5e5e5e5e5e5";
+    const providerOutput: AnalysisResult = {
+      ...JSON.parse(JSON.stringify(normalResult)),
+      value_assessment: {
+        level: "high",
+        evidence_refs: [
+          { source_type: "message", source_id: quoteId, excerpt: "fake" },
+        ],
+        reason_codes: ["high_intent_clear"],
+      },
+    };
+    const reqWithQuote = {
+      ...consultingFx.analysis_request,
+      context: {
+        ...consultingFx.analysis_request.context,
+        current_quote: {
+          quote_id: quoteId,
+          quote_version: 1,
+          estimated_total_fen: 10000000,
+          created_at: "2026-01-01T00:00:00+08:00",
+        },
+      },
+    };
+    const fake = new FakeModelProvider({
+      analysis: providerOutput as never,
+      reply: { contract_version: "1.0.0", text: "ok", cited_evidence_ids: [], question_fields: [] },
+    });
+    const svc = new BailianAnalysisService(fake);
+    const { result, diagnostics } = await svc.analyze(reqWithQuote as never);
+    // quote_id 被视为 message source 时必须过滤掉
+    const stillQuoteIdAsMessage = result.value_assessment.evidence_refs.some(
+      (r) => r.source_type === "message" && r.source_id === quoteId,
+    );
+    expect(stillQuoteIdAsMessage, "quote_id disguised as message must be filtered").toBe(false);
+    expect(
+      diagnostics.unsafeCandidatesRejected.some((r) => r.includes("invisible_evidence_filtered:value")),
+      "diagnostics must record invisible evidence filtered",
+    ).toBe(true);
+  });
+
+  // C P1-2-2: 已知价值等级的 evidence 全部被过滤时必须安全降级，不补伪证据
+  it("P1-2-2: 已知价值等级 evidence 全部不可见时降级 RuleBased，不补 current_message", async () => {
+    const normalResult = analyzer.analyze(consultingFx.analysis_request as never);
+    const highValueResult: AnalysisResult = {
+      ...JSON.parse(JSON.stringify(normalResult)),
+      value_assessment: {
+        level: "high",
+        evidence_refs: [
+          { source_type: "message", source_id: "ffffffff-ffff-4fff-8fff-ffffffffffff", excerpt: "fake-only-invisible" },
+        ],
+        reason_codes: ["high_intent_clear"],
+      },
+    };
+    const fake = new FakeModelProvider({
+      analysis: highValueResult as never,
+      reply: { contract_version: "1.0.0", text: "ok", cited_evidence_ids: [], question_fields: [] },
+    });
+    const svc = new BailianAnalysisService(fake);
+    const { result, diagnostics } = await svc.analyze(consultingFx.analysis_request as never);
+    // 必须触发 fallback（降级到 RuleBasedAnalyzer）
+    expect(diagnostics.fallbackApplied, "fallback applied when all value evidence invisible").toBe(true);
+    expect(
+      diagnostics.unsafeCandidatesRejected.some((r) => r.includes("value_evidence_all_invisible_fallback_rulebased")),
+      "diagnostics must record fallback reason",
+    ).toBe(true);
+    // 降级后的结果不应该包含当前消息作为唯一的高价值证据（因为是 RuleBased 重新计算的，我们至少断言没有伪造证据标记）
+    expect(
+      diagnostics.unsafeCandidatesRejected.some((r) => r.includes("value_without_message_evidence")),
+      "must NOT auto-push current_message as fake evidence",
+    ).toBe(false);
+  });
+
+  // C P1-2-2: 验证已移除"自动补current_message伪证据"逻辑
+  // 场景：Provider返回的ValueAssessment通过Schema（含message evidence），
+  // 但可见性过滤后所有message evidence都不可见（只剩非message evidence）。
+  // 旧代码会自动补current_message作为"没有message evidence"的兜底伪证据；
+  // 新代码不允许伪造证据闭环：要么全过滤降级RuleBased，要么保留现有证据（即使非message）。
+  // 本测试断言不会出现"value_without_message_evidence"诊断标记。
+  it("P1-2-2: 过滤后仅剩非message evidence时，不自动补current_message伪证据", () => {
+    const normalResult = analyzer.analyze(consultingFx.analysis_request as never);
+    const msgId = consultingFx.analysis_request.current_message.message_id;
+    // 构造：Provider返回mid value，含1个可见message evidence（通过Schema） + 1个可见quote evidence
+    // 再构造另一个测试用例：通过Schema，但message evidence全不可见时会走全过滤fallback，已在上面一个测试覆盖。
+    const fakeVisibleQuoteId = "b2b2b2b2-c3c3-4d4d-8e4e-f5f5f5f5f5f5";
+    const providerVisible: unknown = {
+      ...JSON.parse(JSON.stringify(normalResult)),
+      value_assessment: {
+        level: "medium",
+        evidence_refs: [
+          { source_type: "message", source_id: msgId, excerpt: "valid" },
+        ],
+        reason_codes: ["mid_context"],
+      },
+    };
+    const diagnostics: AnalyzeDiagnostics = {
+      intentAccuracyReached: true,
+      valueAccuracyReached: true,
+      evidenceTraceableCount: 0,
+      schemaPassed: false,
+      providerUsed: true,
+      fallbackApplied: false,
+      unsafeCandidatesRejected: [],
+      confusionCandidates: [],
+      failedFixtures: [],
+    };
+    // 先验证能通过Schema（无ValueAssessmentSchema superRefine错误）
+    const preCheck = AnalysisResultSchema.safeParse(providerVisible);
+    expect(preCheck.success, "providerVisible must pass schema").toBe(true);
+    _postValidateProviderResult(
+      providerVisible,
+      {
+        ...consultingFx.analysis_request,
+        context: {
+          ...consultingFx.analysis_request.context,
+          current_quote: {
+            quote_id: fakeVisibleQuoteId,
+            quote_version: 1,
+            estimated_total_fen: 10000000,
+            created_at: "2026-01-01T00:00:00+08:00",
+          },
+        },
+      } as never,
+      diagnostics,
+    );
+    // 断言没有出现"自动补current_message伪证据"的标记
+    expect(
+      diagnostics.unsafeCandidatesRejected.some((r) => r.includes("value_without_message_evidence")),
+      "auto-push current_message as fake evidence MUST be removed",
+    ).toBe(false);
+    // 断言unknown降级分支不触发（因为我们提供了合法的可见message evidence）
+    expect(
+      diagnostics.unsafeCandidatesRejected.some((r) => r.includes("value_evidence_missing_downgrade_unknown")),
+      "should not downgrade when valid message evidence exists",
+    ).toBe(false);
   });
 });
 

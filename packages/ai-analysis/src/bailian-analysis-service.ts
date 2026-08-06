@@ -1010,24 +1010,49 @@ function countEvidenceMessages(result: AnalysisResult): number {
   return count;
 }
 
-function collectVisibleSourceIds(request: AnalysisRequest): Set<string> {
-  const out = new Set<string>();
-  out.add(request.current_message.message_id);
-  for (const m of request.context.recent_messages) out.add(m.message_id);
+type VisibleSourceIdsMap = Map<SourceRef["source_type"], Set<string>>;
+
+function collectVisibleSourceIds(request: AnalysisRequest): VisibleSourceIdsMap {
+  const out: VisibleSourceIdsMap = new Map();
+  const ensure = (t: SourceRef["source_type"]) => {
+    if (!out.has(t)) out.set(t, new Set());
+    return out.get(t)!;
+  };
+  // message: current + recent + memory_summary.source_message_ids
+  ensure("message").add(request.current_message.message_id);
+  for (const m of request.context.recent_messages) ensure("message").add(m.message_id);
+  // Also expose any message_ids referenced by facts' source_refs (these are the
+  // legitimate evidence IDs; fact_id itself is not a valid SourceRef source_type,
+  // so facts only contribute evidence via their original message refs)
   for (const bucket of [
     request.context.confirmed_facts,
     request.context.inferred_facts,
     request.context.conflicted_facts,
   ] as const) {
-    for (const f of bucket) out.add(f.fact_id);
+    for (const f of bucket) {
+      for (const sr of f.source_refs) {
+        // only register message/memory_summary/quote/knowledge_chunk per their type
+        ensure(sr.source_type).add(sr.source_id);
+      }
+    }
   }
+  // memory_summary
   if (request.context.memory_summary) {
-    out.add(request.context.memory_summary.summary_id);
-    for (const m of request.context.memory_summary.source_message_ids) out.add(m);
+    ensure("memory_summary").add(request.context.memory_summary.summary_id);
+    for (const m of request.context.memory_summary.source_message_ids) ensure("message").add(m);
   }
-  if (request.context.current_quote) out.add(request.context.current_quote.quote_id);
-  for (const r of request.context.recalled_items) out.add(r.source_ref.source_id);
+  // quote
+  if (request.context.current_quote) ensure("quote").add(request.context.current_quote.quote_id);
+  // recalled items: map by their source_ref.source_type
+  for (const r of request.context.recalled_items) {
+    ensure(r.source_ref.source_type).add(r.source_ref.source_id);
+  }
   return out;
+}
+
+function isSourceRefVisible(ref: SourceRef, visible: VisibleSourceIdsMap): boolean {
+  const ids = visible.get(ref.source_type);
+  return !!ids && ids.has(ref.source_id);
 }
 
 function postValidateProviderResult(
@@ -1077,40 +1102,56 @@ function postValidateProviderResult(
     };
   }
 
-  if (res.value_assessment.level !== "unknown") {
-    const hasMsg = res.value_assessment.evidence_refs.some((r) => r.source_type === "message");
-    if (!hasMsg) {
-      diagnostics.unsafeCandidatesRejected.push("value_without_message_evidence");
-      (res as AnalysisResult).value_assessment.evidence_refs.push(messageRef(request));
-    }
-  }
+  // C P1-2-2: 禁止自动补 current_message 作为伪证据闭环。
+  // 如果 Provider 给出的 value_assessment 没有可见 message evidence，
+  // 后续经过可见性过滤后证据为空时，降级到 RuleBasedAnalyzer，而非伪造证据。
 
   if (res.intent === "unclear" && res.recommended_next_action === "prepare_quote") {
     diagnostics.unsafeCandidatesRejected.push("unclear_intent_forbidden_quote_action");
     (res as AnalysisResult).recommended_next_action = "answer_question";
   }
 
-  // P1-2: filter provider evidence refs to only visible source IDs
-  const visibleIds = collectVisibleSourceIds(request);
+  // C P1-2-1: 按 source_type + source_id 双重验证可见性，防止跨类型伪装（如quote_id伪装message）
+  const visibleMap = collectVisibleSourceIds(request);
   const allRefArrays = [
     { refs: (res as AnalysisResult).value_assessment.evidence_refs, label: "value" },
     ...res.concerns.map((c) => ({ refs: (c as Concern).evidence_refs, label: `concern:${c.code}` })),
     ...res.safety_flags.map((s) => ({ refs: (s as SafetyFlag).evidence_refs, label: `safety:${s.code}` })),
     ...res.slot_updates.map((s) => ({ refs: (s as SlotUpdate).source_refs, label: `slot:${s.slot}` })),
   ];
+  let valueEvidenceAllFiltered = false;
   for (const { refs, label } of allRefArrays) {
     const before = refs.length;
-    (refs as SourceRef[]).splice(0, refs.length, ...refs.filter((r) => visibleIds.has(r.source_id)));
+    const after = refs.filter((r) => isSourceRefVisible(r, visibleMap));
+    (refs as SourceRef[]).splice(0, refs.length, ...after);
     if (refs.length < before) {
       diagnostics.unsafeCandidatesRejected.push(`invisible_evidence_filtered:${label}:${before - refs.length}_removed`);
     }
+    if (label === "value" && before > 0 && after.length === 0 && res.value_assessment.level !== "unknown") {
+      valueEvidenceAllFiltered = true;
+    }
   }
 
-  // P1-2 fix: if value_assessment level is known but evidence_refs became empty after filtering,
-  // restore with current message ref to satisfy AnalysisResultSchema
+  // C P1-2-2: 当已知价值等级的 evidence_refs 全部被过滤时，安全降级：
+  // 1) 不补 current_message 作为伪证据；
+  // 2) 直接回退到 RuleBasedAnalyzer，并标记明确 fallbackReason。
+  if (valueEvidenceAllFiltered) {
+    diagnostics.unsafeCandidatesRejected.push("value_evidence_all_invisible_fallback_rulebased");
+    const fallback = new RuleBasedAnalyzer().analyze(request);
+    diagnostics.fallbackApplied = true;
+    diagnostics.fallbackReason = "provider_malformed";
+    return fallback;
+  }
+
+  // C P1-2-2: 若 Provider 给出已知价值等级但 evidence_refs 本来就为空（不是被过滤的），
+  // 视为不可信，降级为 unknown + 空证据，而不是补 current_message
   if (res.value_assessment.level !== "unknown" && res.value_assessment.evidence_refs.length === 0) {
-    diagnostics.unsafeCandidatesRejected.push("value_evidence_empty_after_filter_restore");
-    (res as AnalysisResult).value_assessment.evidence_refs.push(messageRef(request));
+    diagnostics.unsafeCandidatesRejected.push("value_evidence_missing_downgrade_unknown");
+    (res as AnalysisResult).value_assessment = {
+      level: "unknown",
+      evidence_refs: [],
+      reason_codes: ["not_a_sales_signal"],
+    };
   }
 
   // P1-3: provider cannot prepare_quote when missing_fields exist
@@ -1137,6 +1178,8 @@ export {
   detectConcerns as _diagnoseConcerns,
   detectSafety as _diagnoseSafety,
   extractSlotUpdates as _diagnoseSlots,
+  postValidateProviderResult as _postValidateProviderResult,
+  collectVisibleSourceIds as _collectVisibleSourceIds,
   INTENT_RULES,
   CONCERN_RULES,
   SAFETY_RULES,
