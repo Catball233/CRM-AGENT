@@ -200,7 +200,7 @@ const quoteMissingAnalysis = {
   intent: "quote_request",
   stage_recommendation: "QUALIFYING",
   value_assessment: {
-    level: "high",
+    level: "medium",
     evidence_refs: [{ ...quoteMissingSource, excerpt: "请帮我估一下" }],
     reason_codes: ["explicit_quote_request", "budget_provided"],
   },
@@ -807,13 +807,13 @@ export const aiMemoryScenarioFixtures: AiMemoryScenarioFixture[] = [
     annotation: {
       evaluation_tags: [
         "intent:quote_request",
-        "value:high",
+        "value:medium",
         "missing:city",
         "memory:confirmed-facts",
       ],
       expected: {
         intent: "quote_request",
-        value_level: "high",
+        value_level: "medium",
         next_action: "ask_missing_fields",
         slot_updates: [
           "area_sqm",
@@ -1047,6 +1047,21 @@ export const invalidAiMemoryFixtures = {
         ...quoteMissingMemoryPlan.fact_upserts[0]!,
         source_refs: [],
       },
+    ],
+  },
+  memoryPlanWithForeignConversationEvidence: {
+    ...quoteMissingMemoryPlan,
+    fact_upserts: [
+      {
+        ...quoteMissingMemoryPlan.fact_upserts[0]!,
+        source_refs: [
+          {
+            source_type: "message",
+            source_id: aiMemoryIds.consulting.message,
+          },
+        ],
+      },
+      ...quoteMissingMemoryPlan.fact_upserts.slice(1),
     ],
   },
   invalidSummaryRange: {
