@@ -3,11 +3,18 @@ import type {
   CustomerFact,
   FactCategory,
   FactKey,
+  MemoryMutationPlan,
   MemorySummaryView,
   MessageView,
   QuoteSummaryView,
   SourceRef,
 } from "@crm-agent/contracts";
+
+/** applyMutationPlan 拒绝原因，用于编排器日志和测试断言 */
+export type MutationRejection = {
+  reason: string;
+  detail: string;
+};
 
 /**
  * B-04: 假 Repository，支持独立测试。持久化能力由后续 INT-04 用
@@ -23,14 +30,16 @@ export interface MemoryRepository {
   getLatestSummary(conversationId: string): Promise<MemorySummaryView | null>;
   getLatestQuote(conversationId: string): Promise<QuoteSummaryView | null>;
   getConversationStage(conversationId: string): Promise<ContextBundle["stage"]>;
-  /** 持久化 turn 的记忆变更。返回 true 表示成功保存。 */
+  /**
+   * 持久化 turn 的记忆变更。
+   * 写入边界强制：
+   * - plan.conversation_id 必须与 conversationId 一致
+   * - 每个 upsert 的所有 source_refs 的 source_id 必须属于目标会话的可见消息集合
+   * 返回 true=成功，false=拒绝（目标会话数据保持不变）。
+   */
   applyMutationPlan(
     conversationId: string,
-    plan: {
-      factUpserts: CustomerFact[];
-      factIdsToMarkConflicted: string[];
-      summaryUpsert: MemorySummaryView | null;
-    },
+    plan: MemoryMutationPlan,
   ): Promise<boolean>;
 }
 
@@ -75,23 +84,59 @@ export class InMemoryRepository implements MemoryRepository {
 
   applyMutationPlan(
     conversationId: string,
-    plan: {
-      factUpserts: CustomerFact[];
-      factIdsToMarkConflicted: string[];
-      summaryUpsert: MemorySummaryView | null;
-    },
+    plan: MemoryMutationPlan,
   ): Promise<boolean> {
+    // P0 写入边界：plan.conversation_id 必须与目标会话一致
+    if (plan.conversation_id !== conversationId) {
+      this.lastRejection = {
+        reason: "conversation_id_mismatch",
+        detail: `plan=${plan.conversation_id} target=${conversationId}`,
+      };
+      return Promise.resolve(false);
+    }
+
+    // P0 写入边界：每个 upsert 的所有 source_refs 的 source_id 必须属于目标会话可见消息集合
+    const visibleMessageIds = new Set<string>();
+    for (const m of this.messages.get(conversationId) ?? []) {
+      visibleMessageIds.add(m.message_id);
+    }
+    // summary 的 source_message_ids 也算可见
+    const summary = this.summaries.get(conversationId);
+    if (summary) {
+      for (const mid of summary.source_message_ids) visibleMessageIds.add(mid);
+    }
+    // memory_summary 的 summary_id 本身合法（quote_id 同理）
+    const validSummaryId = summary?.summary_id ?? null;
+    const validQuoteId = this.quotes.get(conversationId)?.quote_id ?? null;
+
+    for (const fact of plan.fact_upserts) {
+      for (const ref of fact.source_refs) {
+        if (!isSourceRefVisible(ref, visibleMessageIds, validSummaryId, validQuoteId)) {
+          this.lastRejection = {
+            reason: "foreign_source_ref",
+            detail: `fact_id=${fact.fact_id} source_type=${ref.source_type} source_id=${ref.source_id}`,
+          };
+          return Promise.resolve(false);
+        }
+      }
+    }
+
+    // 所有校验通过，执行写入
     const existing = this.facts.get(conversationId) ?? [];
     const byId = new Map(existing.map((f) => [f.fact_id, { ...f }]));
-    for (const f of plan.factUpserts) byId.set(f.fact_id, { ...f });
-    for (const factId of plan.factIdsToMarkConflicted) {
+    for (const f of plan.fact_upserts) byId.set(f.fact_id, { ...f });
+    for (const factId of plan.fact_ids_to_mark_conflicted) {
       const f = byId.get(factId);
       if (f) (f as CustomerFact).status = "conflicted";
     }
     this.facts.set(conversationId, [...byId.values()]);
-    if (plan.summaryUpsert) this.summaries.set(conversationId, plan.summaryUpsert);
+    if (plan.summary_upsert) this.summaries.set(conversationId, plan.summary_upsert);
+    this.lastRejection = null;
     return Promise.resolve(true);
   }
+
+  /** 最近一次 applyMutationPlan 的拒绝原因（null=成功或未调用） */
+  lastRejection: MutationRejection | null = null;
 
   // —— 方便测试注入数据的 helper，不属于 Repository 接口 ——
   seedConversation(
@@ -143,3 +188,30 @@ export const defaultFactIdProvider: FactIdProvider = (_conversationId, _factKey,
   // 固定前缀 7f7f，避免与真实 UUID 冲突（UUID v4 variant 固定位 bxxxx 不会变成 b0xx）
   return `7f7f7f7f-0000-4000-8000-00000000${hex}`;
 };
+
+/**
+ * 校验 source_ref 的 source_id 是否属于目标会话的可见集合。
+ * - message: 必须在 visibleMessageIds 中
+ * - memory_summary: 必须等于 validSummaryId
+ * - quote: 必须等于 validQuoteId
+ * - knowledge_chunk: 放行（知识库是全局共享的，不属于会话隔离范围）
+ */
+function isSourceRefVisible(
+  ref: SourceRef,
+  visibleMessageIds: Set<string>,
+  validSummaryId: string | null,
+  validQuoteId: string | null,
+): boolean {
+  switch (ref.source_type) {
+    case "message":
+      return visibleMessageIds.has(ref.source_id);
+    case "memory_summary":
+      return validSummaryId !== null && ref.source_id === validSummaryId;
+    case "quote":
+      return validQuoteId !== null && ref.source_id === validQuoteId;
+    case "knowledge_chunk":
+      return true;
+    default:
+      return false;
+  }
+}

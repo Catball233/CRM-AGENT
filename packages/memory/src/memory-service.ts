@@ -115,7 +115,7 @@ export class MemoryService {
           source_id: stored.summary.summary_id,
         },
         reason: "客户引用上次方案，需要恢复方案摘要",
-        relevance_score: 0.9 + Math.random() * 0.06,
+        relevance_score: 0.96,
       });
     }
     if (stored.quote && mentionsPlan) {
@@ -125,7 +125,7 @@ export class MemoryService {
           source_id: stored.quote.quote_id,
         },
         reason: "客户继续讨论上次报价方案",
-        relevance_score: 0.88 + Math.random() * 0.06,
+        relevance_score: 0.91,
       });
     }
     return out;
@@ -153,8 +153,9 @@ export class MemoryService {
     }
 
     for (const su of analysis.slot_updates) {
-      // 安全：confirmed status 必须有当前 turn 可见的 message 证据
-      if (su.status === "confirmed") {
+      // 安全：confirmed 和 inferred status 必须有当前 turn 可见的 message 证据
+      // P0 修复：inferred 也需要可见性门禁，防止 Provider 用外来 evidence 伪造 inferred 事实
+      if (su.status === "confirmed" || su.status === "inferred") {
         const hasVisible = su.source_refs.some(
           (r) => r.source_type === "message" && visibleMessageIds.has(r.source_id),
         );

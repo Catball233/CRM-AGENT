@@ -398,3 +398,177 @@ describe("B-04: 安全门禁（risk / safety_flags 阻止写入长期记忆）",
     expect(r.success).toBe(true);
   });
 });
+
+describe("P0 回归：跨会话写入边界", () => {
+  it("conversation_id 不匹配时 applyMutationPlan 拒绝且数据不变", async () => {
+    const repo = new InMemoryRepository();
+    const targetConv = "aaaaaaaa-0000-4000-8000-000000000001";
+    const foreignConv = "bbbbbbbb-0000-4000-8000-000000000002";
+
+    // 目标会话预置 1 条 fact
+    const seedFact: CustomerFact = {
+      fact_id: "seed-0001",
+      fact_key: "city" as FactKey,
+      category: "requirement",
+      value: "北京",
+      status: "confirmed",
+      source_refs: [{ source_type: "message", source_id: "msg-seed-001" }],
+      updated_at: "2026-08-06T10:00:00+08:00",
+    };
+    repo.seedConversation(targetConv, "QUALIFYING", [], [seedFact]);
+
+    // 外来 plan：conversation_id 不匹配
+    const foreignPlan: MemoryMutationPlan = {
+      contract_version: "1.0.0",
+      conversation_id: foreignConv,
+      turn_id: "turn-0001",
+      fact_upserts: [
+        {
+          fact_id: "foreign-0001",
+          fact_key: "city" as FactKey,
+          category: "requirement",
+          value: "上海",
+          status: "confirmed",
+          source_refs: [{ source_type: "message", source_id: "msg-foreign-001" }],
+          updated_at: "2026-08-06T11:00:00+08:00",
+        },
+      ],
+      fact_ids_to_mark_conflicted: [],
+      summary_upsert: null,
+    };
+
+    const ok = await repo.applyMutationPlan(targetConv, foreignPlan);
+    expect(ok, "must reject foreign conversation_id plan").toBe(false);
+    expect(repo.lastRejection?.reason).toBe("conversation_id_mismatch");
+
+    // 数据不变
+    const facts = await repo.listFacts(targetConv);
+    expect(facts.confirmed.length, "original fact unchanged").toBe(1);
+    expect(facts.confirmed[0]!.value).toBe("北京");
+  });
+
+  it("source_refs 含外来 message_id 时 applyMutationPlan 拒绝且数据不变", async () => {
+    const repo = new InMemoryRepository();
+    const targetConv = "cccccccc-0000-4000-8000-000000000003";
+
+    // 目标会话有 msg-local-001 但没有 msg-foreign-999
+    repo.seedConversation(targetConv, "QUALIFYING", [
+      {
+        message_id: "msg-local-001",
+        role: "user",
+        content: "北京",
+        sequence: 1,
+        created_at: "2026-08-06T10:00:00+08:00",
+      } as never,
+    ], []);
+
+    // conversation_id 匹配，但 source_refs 引用了不存在的消息
+    const planWithForeignRef: MemoryMutationPlan = {
+      contract_version: "1.0.0",
+      conversation_id: targetConv,
+      turn_id: "turn-0001",
+      fact_upserts: [
+        {
+          fact_id: "foreign-ref-0001",
+          fact_key: "city" as FactKey,
+          category: "requirement",
+          value: "上海",
+          status: "inferred",
+          source_refs: [{ source_type: "message", source_id: "msg-foreign-999" }],
+          updated_at: "2026-08-06T11:00:00+08:00",
+        },
+      ],
+      fact_ids_to_mark_conflicted: [],
+      summary_upsert: null,
+    };
+
+    const ok = await repo.applyMutationPlan(targetConv, planWithForeignRef);
+    expect(ok, "must reject foreign source_ref").toBe(false);
+    expect(repo.lastRejection?.reason).toBe("foreign_source_ref");
+
+    // 数据不变
+    const facts = await repo.listFacts(targetConv);
+    expect(facts.confirmed.length + facts.inferred.length, "no fact written").toBe(0);
+  });
+
+  it("inferred 事实带外来 evidence 时 planMemoryMutation 跳过该 upsert", () => {
+    const repo = new InMemoryRepository();
+    const svc = new MemoryService(repo);
+
+    const convId = "dddddddd-0000-4000-8000-000000000004";
+    const localMsgId = "msg-local-inferred-001";
+    const foreignMsgId = "msg-foreign-inferred-999";
+
+    repo.seedConversation(convId, "QUALIFYING", [
+      {
+        message_id: localMsgId,
+        role: "user",
+        content: "预算15万",
+        sequence: 1,
+        created_at: "2026-08-06T10:00:00+08:00",
+      } as never,
+    ], []);
+
+    const plan = svc.planMemoryMutation({
+      request: {
+        contract_version: "1.0.0",
+        conversation_id: convId,
+        turn_id: "turn-0001",
+        current_message: {
+          message_id: localMsgId,
+          role: "user",
+          content: "预算15万",
+          sequence: 1,
+          created_at: "2026-08-06T10:00:00+08:00",
+        },
+        context: {
+          contract_version: "1.0.0",
+          conversation_id: convId,
+          stage: "QUALIFYING",
+          confirmed_facts: [],
+          inferred_facts: [],
+          conflicted_facts: [],
+          recent_messages: [],
+          memory_summary: null,
+          current_quote: null,
+          recalled_items: [],
+          built_at: "2026-08-06T10:00:00+08:00",
+        },
+      } as never,
+      analysis: {
+        contract_version: "1.0.0",
+        conversation_id: convId,
+        turn_id: "turn-0001",
+        intent: "provide_information",
+        value_level: "warm",
+        safety_flags: [],
+        concerns: [],
+        slot_updates: [
+          // 本地可见 evidence 的 inferred — 应保留
+          {
+            slot: "budget_max_fen" as never,
+            value: 1500000,
+            status: "inferred" as never,
+            confidence: 0.8,
+            source_refs: [{ source_type: "message", source_id: localMsgId }],
+          },
+          // 外来 evidence 的 inferred — 应被 planMemoryMutation 跳过
+          {
+            slot: "city" as never,
+            value: "上海",
+            status: "inferred" as never,
+            confidence: 0.7,
+            source_refs: [{ source_type: "message", source_id: foreignMsgId }],
+          },
+        ],
+        evidence_refs: [],
+        missing_fields: [],
+        recommended_next_action: "ask_missing_fields",
+      } as never,
+    });
+
+    // 外来 inferred 被跳过，只保留本地可见的
+    expect(plan.fact_upserts.length, "foreign inferred must be skipped").toBe(1);
+    expect(plan.fact_upserts[0]!.fact_key).toBe("budget_max_fen");
+  });
+});
