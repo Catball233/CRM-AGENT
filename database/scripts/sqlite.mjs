@@ -53,7 +53,14 @@ export function migrateDatabase(database, migrationDirectory) {
       version INTEGER PRIMARY KEY CHECK (version > 0),
       filename TEXT NOT NULL UNIQUE,
       checksum_sha256 TEXT NOT NULL CHECK (length(checksum_sha256) = 64),
-      applied_at TEXT NOT NULL CHECK (datetime(applied_at) IS NOT NULL)
+      applied_at TEXT NOT NULL CHECK (
+        datetime(applied_at) IS NOT NULL
+        AND applied_at GLOB '????-??-??T??:??:??*'
+        AND (
+          substr(applied_at, -1) = 'Z'
+          OR (substr(applied_at, -6, 1) IN ('+', '-') AND substr(applied_at, -3, 1) = ':')
+        )
+      )
     ) STRICT;
   `);
 
@@ -156,6 +163,28 @@ export function verifyDatabase(database) {
   return { tableCount: tables.size, foreignKeyViolations: 0, integrity: "ok" };
 }
 
+export function verifyBusinessInvariants(database) {
+  const quoteTotalViolations = database
+    .prepare(`
+      SELECT
+        quote_versions.quote_id,
+        quote_versions.estimated_total_fen,
+        COALESCE(SUM(quote_items.amount_fen), 0) AS item_total_fen
+      FROM quote_versions
+      LEFT JOIN quote_items ON quote_items.quote_id = quote_versions.quote_id
+      GROUP BY quote_versions.quote_id, quote_versions.estimated_total_fen
+      HAVING quote_versions.estimated_total_fen <> COALESCE(SUM(quote_items.amount_fen), 0)
+    `)
+    .all();
+
+  if (quoteTotalViolations.length > 0) {
+    const quoteIds = quoteTotalViolations.map((row) => row.quote_id).join(", ");
+    throw new Error(`Quote total does not match item total for: ${quoteIds}`);
+  }
+
+  return { quoteTotalViolations: 0, businessInvariants: "ok" };
+}
+
 export function resolveDatabasePath(input, projectRoot) {
   const configured = input ?? process.env.DATABASE_URL ?? "file:./data/local.sqlite";
   const withoutScheme = configured.startsWith("file:") ? configured.slice(5) : configured;
@@ -189,7 +218,7 @@ export function rebuildDatabase(databasePath, projectRoot, migrationDirectory, s
   try {
     migrateDatabase(database, migrationDirectory);
     seedDatabase(database, seedDirectory);
-    return verifyDatabase(database);
+    return { ...verifyDatabase(database), ...verifyBusinessInvariants(database) };
   } finally {
     database.close();
   }

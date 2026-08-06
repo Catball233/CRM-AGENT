@@ -5,6 +5,7 @@ import {
   rebuildDatabase,
   resolveDatabasePath,
   seedDatabase,
+  verifyBusinessInvariants,
   verifyDatabase,
 } from "./sqlite.mjs";
 
@@ -28,7 +29,7 @@ if (!command || !["migrate", "seed", "rebuild", "verify"].includes(command)) {
     } else if (command === "seed") {
       seedDatabase(database, seedDirectory);
     }
-    const result = verifyDatabase(database);
+    const result = { ...verifyDatabase(database), ...verifyBusinessInvariants(database) };
     console.log(JSON.stringify({ command, databasePath, ...result }));
   } finally {
     database.close();
