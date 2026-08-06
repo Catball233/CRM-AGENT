@@ -58,6 +58,8 @@ export interface MemoryService {
     analysis: AnalysisResult;
     context: ContextBundle;
   }): Promise<MemoryMutationPlan>;
+  /** Applies a previously validated plan after the conversation result is durable. */
+  apply_mutation(plan: MemoryMutationPlan): Promise<void>;
 }
 
 export interface QuoteService {

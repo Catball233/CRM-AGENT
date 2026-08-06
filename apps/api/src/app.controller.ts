@@ -15,6 +15,7 @@ interface HttpResponse {
   status(code: number): HttpResponse;
   setHeader(name: string, value: string): void;
   write(chunk: string): void;
+  flushHeaders?(): void;
   end(): void;
 }
 
@@ -53,22 +54,20 @@ export class AppController {
     @Body() body: unknown,
     @Res({ passthrough: true }) response: HttpResponse,
   ) {
-    const result = await this.conversations.submit(conversationId, body);
-    const responseMode =
-      typeof body === "object" && body !== null && "response_mode" in body
-        ? (body as { response_mode?: unknown }).response_mode
-        : undefined;
-    if (responseMode === "stream") {
+    if (this.conversations.responseModeFor(body) === "stream") {
+      await this.conversations.validateSubmission(conversationId, body);
       response.status(HttpStatus.OK);
       response.setHeader("Content-Type", "text/event-stream");
       response.setHeader("Cache-Control", "no-cache");
       response.setHeader("Connection", "keep-alive");
-      for (const event of result.events) {
+      response.flushHeaders?.();
+      await this.conversations.submit(conversationId, body, (event) => {
         response.write(`id: ${event.event_id}\nevent: ${event.event_type}\ndata: ${JSON.stringify(event)}\n\n`);
-      }
+      });
       response.end();
       return;
     }
+    const result = await this.conversations.submit(conversationId, body);
     if (result.kind === "failed") {
       throw result.error;
     }
