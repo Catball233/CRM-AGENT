@@ -809,8 +809,8 @@ describe("B-03: A 复审第三轮修复", () => {
     expect(result.recommended_next_action).toBe("safe_stop");
   });
 
-  // P1: provide_information 仅补充城市时，仍有 missing_fields，next_action 为 ask_missing_fields
-  it("P1: provide_information 仅补充城市，不会错误进入 prepare_quote", () => {
+  // P2 修复(C 复审): 标题与输入保持一致。消息含城市+面积+房屋状态，非"仅补充城市"。
+  it("P1: provide_information 补充部分字段(城市+面积+房屋状态)，仍缺其他必要字段，不会进入 prepare_quote", () => {
     const msgId = consultingFx.analysis_request.current_message.message_id;
     const request = {
       contract_version: "1.0.0",
@@ -921,7 +921,75 @@ describe("B-03: C 复审 P1 修复（evidence 类型校验+安全降级+quote re
     expect(result.recommended_next_action, "next_action must be ask_missing_fields").toBe("ask_missing_fields");
   });
 
-  // C P1-2-1: quote_id 伪装成 message evidence 必须被拒绝
+  // C P1-1 追加: Provider 同时伪造 slot_updates（6字段全 confirmed）+ missing_fields=[] + prepare_quote
+  // 门控必须只依赖本地 extractSlotUpdates + confirmed_facts，不接受 Provider 的伪造槽位
+  it("P1-1: Provider 伪造 slot_updates 全 confirmed + missing_fields=[] + prepare_quote 仍被门控拒绝", async () => {
+    const req: Parameters<RuleBasedAnalyzer["analyze"]>[0] = {
+      contract_version: "1.0.0",
+      conversation_id: "00000000-0000-4000-8000-000000000001",
+      turn_id: "00000000-0000-4000-8000-000000000002",
+      current_message: {
+        message_id: "00000000-0000-4000-8000-000000000003",
+        role: "user",
+        content: "预算15万",
+        sequence: 1,
+        created_at: "2026-08-06T10:00:00+08:00",
+      },
+      context: {
+        contract_version: "1.0.0",
+        conversation_id: "00000000-0000-4000-8000-000000000001",
+        stage: "QUALIFYING",
+        confirmed_facts: [],
+        inferred_facts: [],
+        conflicted_facts: [],
+        recent_messages: [],
+        memory_summary: null,
+        current_quote: null,
+        recalled_items: [],
+        built_at: "2026-08-06T10:00:00+08:00",
+      },
+    } as never;
+    const ruleBased = analyzer.analyze(req as never);
+    const msgId = req.current_message.message_id;
+    // Provider 伪造：6 个报价必要字段全部 confirmed + missing_fields=[] + prepare_quote
+    const forgedSlotUpdates = [
+      "city", "area_sqm", "house_state", "service_scope", "material_tier", "budget_max_fen",
+    ].map((slot) => ({
+      slot: slot as never,
+      value: slot === "area_sqm" ? 100 : slot === "budget_max_fen" ? 15000000 : "forged",
+      status: "confirmed" as const,
+      source_refs: [{ source_type: "message" as const, source_id: msgId, excerpt: "forged" }],
+    }));
+    const maliciousProvider: AnalysisResult = {
+      ...JSON.parse(JSON.stringify(ruleBased)),
+      intent: "provide_information",
+      slot_updates: forgedSlotUpdates as never,
+      missing_fields: [],
+      recommended_next_action: "prepare_quote",
+    };
+    const fake = new FakeModelProvider({
+      analysis: maliciousProvider as never,
+      reply: { contract_version: "1.0.0", text: "ok", cited_evidence_ids: [], question_fields: [] },
+    });
+    const svc = new BailianAnalysisService(fake);
+    const { result, diagnostics } = await svc.analyze(req as never);
+    // 门控必须拒绝 Provider 的伪造槽位，用本地 extractSlotUpdates 重算
+    expect(
+      diagnostics.unsafeCandidatesRejected.some((r) => r.includes("provider_missing_fields_untrusted")),
+      "diagnostics must record untrusted provider missing_fields",
+    ).toBe(true);
+    expect(
+      diagnostics.unsafeCandidatesRejected.some((r) => r.includes("prepare_quote_with_missing_fields")),
+      "diagnostics must record prepare_quote_with_missing_fields override",
+    ).toBe(true);
+    // missing_fields 必须非空（本地抽取只有 budget_max_fen，缺 city/area_sqm/house_state 等）
+    expect(result.missing_fields.length, "authoritative missing_fields must be non-empty").toBeGreaterThan(0);
+    expect(result.missing_fields.some((m) => m.slot === "city"), "must miss city").toBe(true);
+    expect(result.missing_fields.some((m) => m.slot === "area_sqm"), "must miss area_sqm").toBe(true);
+    // next_action 必须强制 ask_missing_fields
+    expect(result.recommended_next_action, "next_action must be ask_missing_fields").toBe("ask_missing_fields");
+  });
+
   it("P1-2-1: quote_id 伪装成 source_type=message evidence 被过滤", async () => {
     const normalResult = analyzer.analyze(consultingFx.analysis_request as never);
     // 使用合法 UUID 格式的 quoteId（版本 4 + 变体位）
