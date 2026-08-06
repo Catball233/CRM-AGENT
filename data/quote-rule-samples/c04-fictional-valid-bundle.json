@@ -1,0 +1,15 @@
+[
+  {
+    "rule_id": "FIXTURE-BEIJING-DESIGN-STANDARD",
+    "version": 1,
+    "city": "北京",
+    "calculation_type": "AREA_MULTIPLY",
+    "unit_price_fen": 8000,
+    "conditions": {
+      "scene": "整装",
+      "designer_tier": "标准"
+    },
+    "effective_from": "2026-01-01T00:00:00Z",
+    "effective_to": "2027-01-01T00:00:00Z"
+  }
+]

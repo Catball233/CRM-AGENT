@@ -45,7 +45,7 @@ describe("SQLite schema, migrations, and seed", () => {
       migrateDatabase(database, migrationDirectory);
 
       expect(database.prepare("SELECT COUNT(*) AS count FROM schema_migrations").get()).toEqual({
-        count: 2,
+        count: 3,
       });
       expect(verifyDatabase(database)).toMatchObject({ integrity: "ok", foreignKeyViolations: 0 });
     } finally {
