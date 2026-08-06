@@ -571,4 +571,82 @@ describe("P0 回归：跨会话写入边界", () => {
     expect(plan.fact_upserts.length, "foreign inferred must be skipped").toBe(1);
     expect(plan.fact_upserts[0]!.fact_key).toBe("budget_max_fen");
   });
+
+  it("有效 fact + 外来 summary source_message_ids 时 applyMutationPlan 拒绝且 fact 与摘要均不变", async () => {
+    const repo = new InMemoryRepository();
+    const targetConv = "eeeeeeee-0000-4000-8000-000000000005";
+    const localMsgId = "msg-local-summary-001";
+    const foreignMsgId = "msg-foreign-summary-999";
+
+    // 目标会话：预置 fact 与旧摘要
+    const seedFact: CustomerFact = {
+      fact_id: "seed-summary-0001",
+      fact_key: "city" as FactKey,
+      category: "requirement",
+      value: "北京",
+      status: "confirmed",
+      source_refs: [{ source_type: "message", source_id: localMsgId }],
+      updated_at: "2026-08-06T10:00:00+08:00",
+    };
+    const seedSummary = {
+      summary_id: "summary-seed-0001",
+      conversation_id: targetConv,
+      short_bullets: ["初始摘要"],
+      source_message_ids: [localMsgId],
+      covers_sequence_from: 1,
+      covers_sequence_to: 1,
+      updated_at: "2026-08-06T10:00:00+08:00",
+    };
+    repo.seedConversation(targetConv, "QUALIFYING", [
+      {
+        message_id: localMsgId,
+        role: "user",
+        content: "北京预算15万",
+        sequence: 1,
+        created_at: "2026-08-06T10:00:00+08:00",
+      } as never,
+    ], [seedFact], seedSummary as never);
+
+    // plan：fact 全部合法（本地 evidence），但 summary_upsert.source_message_ids 混入外来消息
+    const plan: MemoryMutationPlan = {
+      contract_version: "1.0.0",
+      conversation_id: targetConv,
+      turn_id: "turn-0001",
+      fact_upserts: [
+        {
+          fact_id: "valid-fact-0001",
+          fact_key: "budget_max_fen" as FactKey,
+          category: "requirement",
+          value: 1500000,
+          status: "confirmed",
+          source_refs: [{ source_type: "message", source_id: localMsgId }],
+          updated_at: "2026-08-06T11:00:00+08:00",
+        },
+      ],
+      fact_ids_to_mark_conflicted: [],
+      summary_upsert: {
+        summary_id: "summary-new-0001",
+        conversation_id: targetConv,
+        short_bullets: ["新摘要：预算 15 万"],
+        source_message_ids: [localMsgId, foreignMsgId], // foreignMsgId 外来
+        covers_sequence_from: 1,
+        covers_sequence_to: 2,
+        updated_at: "2026-08-06T11:00:00+08:00",
+      } as never,
+    };
+
+    const ok = await repo.applyMutationPlan(targetConv, plan);
+    expect(ok, "must reject foreign source_message_ids in summary_upsert").toBe(false);
+    expect(repo.lastRejection?.reason).toBe("foreign_summary_source_message");
+
+    // fact 不变
+    const facts = await repo.listFacts(targetConv);
+    expect(facts.confirmed.length, "no new fact written").toBe(1);
+    expect(facts.confirmed[0]!.fact_id).toBe("seed-summary-0001");
+    expect(facts.confirmed[0]!.value).toBe("北京");
+    // summary 不变
+    const summary = await repo.getLatestSummary(targetConv);
+    expect(summary?.summary_id, "summary must remain unchanged").toBe("summary-seed-0001");
+    expect(summary?.source_message_ids).toEqual([localMsgId]);
+  });
 });

@@ -121,6 +121,19 @@ export class InMemoryRepository implements MemoryRepository {
       }
     }
 
+    // P0 写入边界：summary_upsert.source_message_ids 全部属于目标会话可见消息集合
+    if (plan.summary_upsert) {
+      for (const mid of plan.summary_upsert.source_message_ids) {
+        if (!visibleMessageIds.has(mid)) {
+          this.lastRejection = {
+            reason: "foreign_summary_source_message",
+            detail: `summary_id=${plan.summary_upsert.summary_id} foreign_message_id=${mid}`,
+          };
+          return Promise.resolve(false);
+        }
+      }
+    }
+
     // 所有校验通过，执行写入
     const existing = this.facts.get(conversationId) ?? [];
     const byId = new Map(existing.map((f) => [f.fact_id, { ...f }]));
