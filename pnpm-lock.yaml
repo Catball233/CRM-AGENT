@@ -115,6 +115,31 @@ importers:
         specifier: ^4.1.10
         version: 4.1.10(@types/node@26.1.2)(vite@8.2.0(@types/node@26.1.2)(esbuild@0.28.1)(tsx@4.23.7))
 
+  packages/memory:
+    dependencies:
+      '@crm-agent/ai-analysis':
+        specifier: workspace:*
+        version: link:../ai-analysis
+      '@crm-agent/contracts':
+        specifier: workspace:*
+        version: link:../contracts
+      zod:
+        specifier: ^4.4.3
+        version: 4.4.3
+    devDependencies:
+      '@crm-agent/test-fixtures':
+        specifier: workspace:*
+        version: link:../test-fixtures
+      '@types/node':
+        specifier: ^26.1.2
+        version: 26.1.2
+      typescript:
+        specifier: ^7.0.2
+        version: 7.0.2
+      vitest:
+        specifier: ^4.1.10
+        version: 4.1.10(@types/node@26.1.2)(vite@8.2.0(@types/node@26.1.2)(esbuild@0.28.1)(tsx@4.23.7))
+
   packages/model-provider:
     dependencies:
       '@crm-agent/contracts':

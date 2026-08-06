@@ -93,3 +93,4 @@ export const ReplyDraftSchema = z
     question_fields: z.array(SlotNameSchema).max(3),
   })
   .strict();
+export type AnalysisRequest = z.infer<typeof AnalysisRequestSchema>;

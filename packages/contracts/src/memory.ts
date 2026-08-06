@@ -112,3 +112,8 @@ export const MemoryMutationPlanSchema = z
   })
   .strict();
 export type MemoryMutationPlan = z.infer<typeof MemoryMutationPlanSchema>;
+export type FactKey = z.infer<typeof FactKeySchema>;
+export type FactCategory = z.infer<typeof FactCategorySchema>;
+export type MemorySummaryView = z.infer<typeof MemorySummaryViewSchema>;
+export type QuoteSummaryView = z.infer<typeof QuoteSummaryViewSchema>;
+export type RecalledItem = z.infer<typeof RecalledItemSchema>;
