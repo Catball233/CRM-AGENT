@@ -1,0 +1,358 @@
+import {
+  AnalysisRequestSchema,
+  AnalysisResultSchema,
+  ContextBundleSchema,
+  CONTRACT_VERSION,
+  ConversationSnapshotSchema,
+  ConversationViewSchema,
+  IdSchema,
+  KnowledgeSearchRequestSchema,
+  KnowledgeSearchResultSchema,
+  MemoryMutationPlanSchema,
+  QuoteOutcomeSchema,
+  QuoteRequestSchema,
+  ReplyDraftSchema,
+  ReplyGenerationRequestSchema,
+} from "@crm-agent/contracts";
+import type {
+  AiProvider,
+  ApiLogFields,
+  ApiLogger,
+  ConversationRepository,
+  CreateConversationInput,
+  KnowledgeProvider,
+  MemoryService,
+  QuoteService,
+} from "./ports";
+import { ModelUnavailableError } from "./errors";
+
+const LOCAL_TEST_CONTRACT_VERSION = CONTRACT_VERSION;
+const FAKE_BUILT_AT = "2026-08-05T00:00:00.000Z";
+
+interface StoredConversation {
+  contract_version: typeof LOCAL_TEST_CONTRACT_VERSION;
+  snapshot: ReturnType<typeof ConversationSnapshotSchema.parse>;
+}
+
+export class FakeConversationRepository implements ConversationRepository {
+  private readonly conversations = new Map<string, StoredConversation>();
+
+  async create(input: CreateConversationInput) {
+    const conversationId = IdSchema.parse(input.conversation_id);
+    if (input.contract_version !== LOCAL_TEST_CONTRACT_VERSION) {
+      throw new Error("Unsupported contract version for local fake repository");
+    }
+
+    const conversation = ConversationViewSchema.parse({
+      contract_version: LOCAL_TEST_CONTRACT_VERSION,
+      conversation_id: conversationId,
+      stage: "DISCOVERY",
+      status: "ACTIVE",
+      created_at: input.created_at,
+      updated_at: input.created_at,
+    });
+    const snapshot = ConversationSnapshotSchema.parse({
+      contract_version: LOCAL_TEST_CONTRACT_VERSION,
+      conversation,
+      messages: [],
+      current_quote: null,
+      active_turn_id: null,
+    });
+
+    this.conversations.set(conversationId, {
+      contract_version: LOCAL_TEST_CONTRACT_VERSION,
+      snapshot,
+    });
+    return conversation;
+  }
+
+  async get_snapshot(conversationId: string) {
+    const record = this.conversations.get(IdSchema.parse(conversationId));
+    return record === undefined ? null : ConversationSnapshotSchema.parse(record.snapshot);
+  }
+
+  async save_snapshot(snapshot: ReturnType<typeof ConversationSnapshotSchema.parse>) {
+    const parsed = ConversationSnapshotSchema.parse(snapshot);
+    const record = this.conversations.get(parsed.conversation.conversation_id);
+    if (record === undefined) {
+      throw new Error("Cannot save a snapshot for an unknown conversation");
+    }
+    if (record.contract_version !== parsed.contract_version) {
+      throw new Error("Conversation contract version is immutable");
+    }
+    this.conversations.set(parsed.conversation.conversation_id, {
+      contract_version: record.contract_version,
+      snapshot: parsed,
+    });
+  }
+
+  async delete_local_test_conversation(conversationId: string) {
+    this.conversations.delete(IdSchema.parse(conversationId));
+  }
+}
+
+export class FakeAiProvider implements AiProvider {
+  async analyze(input: Parameters<AiProvider["analyze"]>[0]) {
+    const request = AnalysisRequestSchema.parse(input);
+    const source = { source_type: "message" as const, source_id: request.current_message.message_id };
+    const content = request.current_message.content;
+    if (/模拟模型失败/u.test(content)) {
+      throw new ModelUnavailableError();
+    }
+    const isRiskRequest = /(提示词|密钥|底价|忽略.*规则)/u.test(content);
+    const isCompleteQuoteRequest = /(完整报价|可报价)/u.test(content);
+    const isQuoteRequest = /(报价|估价|预算|多少钱)/u.test(content);
+
+    return AnalysisResultSchema.parse(
+      isRiskRequest
+        ? {
+            contract_version: LOCAL_TEST_CONTRACT_VERSION,
+            intent: "risk",
+            stage_recommendation: "CLOSED",
+            value_assessment: { level: "unknown", evidence_refs: [], reason_codes: ["safety_boundary"] },
+            concerns: [],
+            slot_updates: [],
+            missing_fields: [],
+            recommended_next_action: "safe_stop",
+            knowledge_decision: { should_search: false, reason_codes: ["safety_boundary"], topics: [] },
+            safety_flags: [
+              {
+                code: "secret_request",
+                severity: "high",
+                evidence_refs: [{ ...source, excerpt: content.slice(0, 100) }],
+              },
+            ],
+            model_metadata: {
+              provider: "aliyun_bailian",
+              model_id: "fake-model-v1",
+              prompt_version: "fake-analysis-v1",
+            },
+          }
+        : isCompleteQuoteRequest
+          ? {
+              contract_version: LOCAL_TEST_CONTRACT_VERSION,
+              intent: "quote_request",
+              stage_recommendation: "QUOTING",
+              value_assessment: {
+                level: "medium",
+                evidence_refs: [{ ...source, excerpt: content.slice(0, 100) }],
+                reason_codes: ["complete_quote_request"],
+              },
+              concerns: [],
+              slot_updates: [
+                { slot: "city", value: "默认测试城市", status: "confirmed", source_refs: [source] },
+                { slot: "area_sqm", value: 90, status: "confirmed", source_refs: [source] },
+                { slot: "house_state", value: "old_renovation", status: "confirmed", source_refs: [source] },
+                { slot: "service_scope", value: "whole_home", status: "confirmed", source_refs: [source] },
+                { slot: "material_tier", value: "mid", status: "confirmed", source_refs: [source] },
+              ],
+              missing_fields: [],
+              recommended_next_action: "prepare_quote",
+              knowledge_decision: {
+                should_search: true,
+                reason_codes: ["quote_rule_lookup"],
+                topics: ["quote_rule"],
+                query_hint: "本地测试报价规则",
+              },
+              safety_flags: [],
+              model_metadata: {
+                provider: "aliyun_bailian",
+                model_id: "fake-model-v1",
+                prompt_version: "fake-analysis-v1",
+              },
+            }
+          : isQuoteRequest
+          ? {
+              contract_version: LOCAL_TEST_CONTRACT_VERSION,
+              intent: "quote_request",
+              stage_recommendation: "QUALIFYING",
+              value_assessment: {
+                level: "medium",
+                evidence_refs: [{ ...source, excerpt: content.slice(0, 100) }],
+                reason_codes: ["explicit_quote_request"],
+              },
+              concerns: [],
+              slot_updates: [],
+              missing_fields: [{ slot: "city", reason: "报价前需要确认服务地区", priority: 1 }],
+              recommended_next_action: "ask_missing_fields",
+              knowledge_decision: { should_search: false, reason_codes: ["missing_city"], topics: [] },
+              safety_flags: [],
+              model_metadata: {
+                provider: "aliyun_bailian",
+                model_id: "fake-model-v1",
+                prompt_version: "fake-analysis-v1",
+              },
+            }
+          : {
+              contract_version: LOCAL_TEST_CONTRACT_VERSION,
+              intent: "consulting",
+              stage_recommendation: "DISCOVERY",
+              value_assessment: {
+                level: "low",
+                evidence_refs: [{ ...source, excerpt: content.slice(0, 100) }],
+                reason_codes: ["service_consulting"],
+              },
+              concerns: [],
+              slot_updates: [],
+              missing_fields: [],
+              recommended_next_action: "search_knowledge",
+              knowledge_decision: {
+                should_search: true,
+                reason_codes: ["service_question"],
+                topics: ["local_mvp_service"],
+                query_hint: content.slice(0, 200),
+              },
+              safety_flags: [],
+              model_metadata: {
+                provider: "aliyun_bailian",
+                model_id: "fake-model-v1",
+                prompt_version: "fake-analysis-v1",
+              },
+            },
+    );
+  }
+
+  async compose_reply(input: Parameters<AiProvider["compose_reply"]>[0]) {
+    const request = ReplyGenerationRequestSchema.parse(input);
+    const isSafeStop = request.analysis.recommended_next_action === "safe_stop";
+    const isQuestion = request.analysis.recommended_next_action === "ask_missing_fields";
+
+    return ReplyDraftSchema.parse({
+      contract_version: LOCAL_TEST_CONTRACT_VERSION,
+      text: isSafeStop
+        ? "我无法提供内部信息或底价，但可以继续说明公开的本地测试服务范围。"
+        : isQuestion
+          ? "为提供本地测试预估，请先确认服务地区。"
+          : "这是本地测试回复；如需继续，请补充您的装修需求。",
+      cited_evidence_ids: [],
+      question_fields: isQuestion ? request.analysis.missing_fields.map((field) => field.slot).slice(0, 3) : [],
+    });
+  }
+}
+
+export class FakeKnowledgeProvider implements KnowledgeProvider {
+  async search(input: Parameters<KnowledgeProvider["search"]>[0]) {
+    const request = KnowledgeSearchRequestSchema.parse(input);
+    return KnowledgeSearchResultSchema.parse({
+      contract_version: LOCAL_TEST_CONTRACT_VERSION,
+      evidence: [
+        {
+          contract_version: LOCAL_TEST_CONTRACT_VERSION,
+          evidence_id: request.turn_id,
+          knowledge_base_id: "fake-knowledge-base",
+          document_id: "fake-rule-document",
+          document_version: "1.0.0",
+          chunk_id: "fake-chunk-001",
+          title: "本地测试知识条目",
+          excerpt: "仅用于 A-03 API 集成测试。",
+          score: 1,
+          metadata: {},
+          candidate_rule_ids: ["RULE-FAKE-001"],
+        },
+      ],
+      rule_candidates: [{ rule_id: "RULE-FAKE-001", evidence_id: request.turn_id }],
+      provider_request_id: `fake-knowledge-${request.turn_id}`,
+    });
+  }
+}
+
+export class FakeMemoryService implements MemoryService {
+  async build_context(conversationId: string, currentMessageId: string) {
+    const parsedConversationId = IdSchema.parse(conversationId);
+    IdSchema.parse(currentMessageId);
+    return ContextBundleSchema.parse({
+      contract_version: LOCAL_TEST_CONTRACT_VERSION,
+      conversation_id: parsedConversationId,
+      stage: "DISCOVERY",
+      recent_messages: [],
+      confirmed_facts: [],
+      inferred_facts: [],
+      conflicted_facts: [],
+      memory_summary: null,
+      current_quote: null,
+      recalled_items: [],
+      built_at: FAKE_BUILT_AT,
+    });
+  }
+
+  async plan_mutation(input: Parameters<MemoryService["plan_mutation"]>[0]) {
+    const conversationId = IdSchema.parse(input.conversation_id);
+    const turnId = IdSchema.parse(input.turn_id);
+    const analysis = AnalysisResultSchema.parse(input.analysis);
+    const context = ContextBundleSchema.parse(input.context);
+    if (context.conversation_id !== conversationId) {
+      throw new Error("Memory context belongs to another conversation");
+    }
+    void analysis;
+    return MemoryMutationPlanSchema.parse({
+      contract_version: LOCAL_TEST_CONTRACT_VERSION,
+      conversation_id: conversationId,
+      turn_id: turnId,
+      fact_upserts: [],
+      fact_ids_to_mark_conflicted: [],
+      summary_upsert: null,
+    });
+  }
+}
+
+export class FakeQuoteService implements QuoteService {
+  async calculate(input: Parameters<QuoteService["calculate"]>[0]) {
+    const request = QuoteRequestSchema.parse(input);
+    const amountFen = 1_000_000;
+    const ruleId = request.candidate_rule_ids[0]!;
+
+    return QuoteOutcomeSchema.parse({
+      kind: "quote",
+      quote: {
+        contract_version: LOCAL_TEST_CONTRACT_VERSION,
+        quote_id: request.turn_id,
+        conversation_id: request.conversation_id,
+        quote_version: 1,
+        parent_quote_id: null,
+        status: "estimated",
+        currency: "CNY",
+        parameters_snapshot: request.confirmed_parameters,
+        items: [
+          {
+            quote_item_id: request.turn_id,
+            category: "construction",
+            label: "本地测试报价项",
+            calculation_type: "FIXED_AMOUNT",
+            amount_fen: amountFen,
+            calculation_inputs: { fixture: true },
+            rule_ref: { rule_id: ruleId, rule_version_id: request.conversation_id, version: 1 },
+          },
+        ],
+        estimated_total_fen: amountFen,
+        rule_versions: [{ rule_id: ruleId, rule_version_id: request.conversation_id, version: 1 }],
+        knowledge_evidence_ids: request.knowledge_evidence_ids,
+        assumptions: ["仅用于本地测试"],
+        exclusions: ["不包含正式量房后的变更"],
+        disclaimer: "本结果为本地测试预估，不构成正式报价。",
+        created_at: request.requested_at,
+      },
+    });
+  }
+}
+
+export interface FakeLogRecord {
+  level: "info" | "warn" | "error";
+  event: string;
+  fields: ApiLogFields;
+}
+
+export class FakeApiLogger implements ApiLogger {
+  readonly records: FakeLogRecord[] = [];
+
+  info(event: string, fields: ApiLogFields) {
+    this.records.push({ level: "info", event, fields: { ...fields } });
+  }
+
+  warn(event: string, fields: ApiLogFields) {
+    this.records.push({ level: "warn", event, fields: { ...fields } });
+  }
+
+  error(event: string, fields: ApiLogFields) {
+    this.records.push({ level: "error", event, fields: { ...fields } });
+  }
+}

@@ -45,7 +45,7 @@ describe("SQLite schema, migrations, and seed", () => {
       migrateDatabase(database, migrationDirectory);
 
       expect(database.prepare("SELECT COUNT(*) AS count FROM schema_migrations").get()).toEqual({
-        count: 1,
+        count: 2,
       });
       expect(verifyDatabase(database)).toMatchObject({ integrity: "ok", foreignKeyViolations: 0 });
     } finally {
@@ -121,6 +121,60 @@ describe("SQLite schema, migrations, and seed", () => {
           "2026-08-05T17:00:01+08:00",
         ).changes,
       ).toBe(1);
+    } finally {
+      database.close();
+    }
+  });
+
+  it("enforces UUID and ISO timestamp formats on retry attempts at the database boundary", () => {
+    const database = openDatabase(join(temporaryDirectory(), "retry-formats.sqlite"));
+    try {
+      migrateDatabase(database, migrationDirectory);
+      database.prepare(`INSERT INTO conversations (
+        conversation_id, stage, status, created_at, updated_at
+      ) VALUES (?, 'DISCOVERY', 'ACTIVE', ?, ?)`).run(
+        "20000000-0000-4000-8000-000000000020",
+        "2026-08-05T09:00:00Z",
+        "2026-08-05T09:00:00Z",
+      );
+      database.prepare(`INSERT INTO turns (
+        turn_id, conversation_id, client_message_id, status, started_at
+      ) VALUES (?, ?, ?, 'PROCESSING', ?)`).run(
+        "20000000-0000-4000-8000-000000000021",
+        "20000000-0000-4000-8000-000000000020",
+        "20000000-0000-4000-8000-000000000022",
+        "2026-08-05T09:00:00Z",
+      );
+      const insertAttempt = database.prepare(`INSERT INTO turn_retry_attempts (
+        turn_id, conversation_id, retry_request_id, attempt_number, status, started_at, finished_at
+      ) VALUES (?, ?, ?, 2, ?, ?, ?)`);
+      const prefix = [
+        "20000000-0000-4000-8000-000000000021",
+        "20000000-0000-4000-8000-000000000020",
+      ] as const;
+
+      expect(() => insertAttempt.run(
+        ...prefix,
+        "not-a-uuid",
+        "PROCESSING",
+        "2026-08-05T09:01:00Z",
+        null,
+      )).toThrow();
+      expect(() => insertAttempt.run(
+        ...prefix,
+        "20000000-0000-4000-8000-000000000023",
+        "PROCESSING",
+        "2026-08-05T09:01:00",
+        null,
+      )).toThrow();
+      expect(() => insertAttempt.run(
+        ...prefix,
+        "20000000-0000-4000-8000-000000000024",
+        "FAILED",
+        "2026-08-05T09:01:00Z",
+        "not-an-iso-time",
+      )).toThrow();
+      expect(database.prepare("SELECT COUNT(*) AS count FROM turn_retry_attempts").get()).toEqual({ count: 0 });
     } finally {
       database.close();
     }
