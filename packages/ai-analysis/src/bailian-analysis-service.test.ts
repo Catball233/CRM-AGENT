@@ -238,7 +238,7 @@ describe("B-03: BailianAnalysisService 依赖 provider 与安全兜底", () => {
     expect(fake.analysisCalls.length).toBe(1);
   });
 
-  it("高严重度安全信号直接跳过 provider（不走 LLM），安全降级", async () => {
+  it("高严重度安全信号直接跳过 provider（不走 LLM），安全降级，诊断为 safety_blocked", async () => {
     const injection = aiMemoryScenarioFixtures.find((f) =>
       f.fixture_id.includes("INJECTION"),
     )!;
@@ -252,8 +252,76 @@ describe("B-03: BailianAnalysisService 依赖 provider 与安全兜底", () => {
       },
     });
     const svc = new BailianAnalysisService(fake);
-    await svc.analyze(injection.analysis_request as never);
+    const { diagnostics } = await svc.analyze(injection.analysis_request as never);
     expect(fake.analysisCalls.length).toBe(0);
+    expect(diagnostics.fallbackApplied).toBe(true);
+    expect(diagnostics.fallbackReason).toBe("safety_blocked");
+  });
+
+  it("P0: 含 PII（手机号）的请求不调用 Provider，走本地安全停止", async () => {
+    const piiRequest = {
+      ...consultingFx.analysis_request,
+      current_message: {
+        ...consultingFx.analysis_request.current_message,
+        content: "我的手机号是13812345678，你们可以联系我",
+      },
+    };
+    const fake = new FakeModelProvider({
+      analysis: analyzer.analyze(consultingFx.analysis_request as never),
+      reply: {
+        contract_version: "1.0.0",
+        text: "stopped",
+        cited_evidence_ids: [],
+        question_fields: [],
+      },
+    });
+    const svc = new BailianAnalysisService(fake);
+    const { result, diagnostics } = await svc.analyze(piiRequest as never);
+    expect(fake.analysisCalls.length).toBe(0);
+    expect(diagnostics.fallbackApplied).toBe(true);
+    expect(diagnostics.fallbackReason).toBe("safety_blocked");
+    expect(result.safety_flags.some((f) => f.code === "pii")).toBe(true);
+    expect(result.recommended_next_action).toBe("safe_stop");
+  });
+
+  it("P0: Provider 返回合法但不安全组合时，后校验强制 safe_stop", async () => {
+    const normalResult = analyzer.analyze(consultingFx.analysis_request as never);
+    const unsafeProviderOutput = {
+      ...normalResult,
+      intent: "risk",
+      safety_flags: [],
+      recommended_next_action: "prepare_quote",
+      stage_recommendation: "QUOTING",
+      value_assessment: {
+        level: "high" as const,
+        evidence_refs: [
+          {
+            source_type: "message" as const,
+            source_id: consultingFx.analysis_request.current_message.message_id,
+            excerpt: "test",
+          },
+        ],
+        reason_codes: ["explicit_quote_request"],
+      },
+    };
+    const fake = new FakeModelProvider({
+      analysis: unsafeProviderOutput,
+      reply: {
+        contract_version: "1.0.0",
+        text: "stopped",
+        cited_evidence_ids: [],
+        question_fields: [],
+      },
+    });
+    const svc = new BailianAnalysisService(fake);
+    const { result, diagnostics } = await svc.analyze(
+      consultingFx.analysis_request as never,
+    );
+    expect(diagnostics.providerUsed).toBe(true);
+    expect(result.recommended_next_action).toBe("safe_stop");
+    expect(result.intent).toBe("risk");
+    expect(result.value_assessment.level).toBe("unknown");
+    expect(diagnostics.unsafeCandidatesRejected.length).toBeGreaterThan(0);
   });
 });
 

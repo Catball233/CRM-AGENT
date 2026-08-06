@@ -40,7 +40,7 @@ export interface AnalyzeDiagnostics {
   schemaPassed: boolean;
   providerUsed: boolean;
   fallbackApplied: boolean;
-  fallbackReason?: "provider_missing" | "provider_error" | "provider_malformed";
+  fallbackReason?: "provider_missing" | "provider_error" | "provider_malformed" | "safety_blocked";
   unsafeCandidatesRejected: string[];
   confusionCandidates: Array<{
     fixture_id: string;
@@ -768,11 +768,13 @@ export class BailianAnalysisService {
     };
 
     const safety = detectSafety(request);
-    if (safety.some((f) => f.severity === "high")) {
+    if (safety.length > 0) {
       const fallback = this.fallback.analyze(request);
       diagnostics.fallbackApplied = true;
-      diagnostics.fallbackReason = "provider_error";
-      diagnostics.unsafeCandidatesRejected.push("high_severity_safety_blocked_before_provider");
+      diagnostics.fallbackReason = "safety_blocked";
+      diagnostics.unsafeCandidatesRejected.push(
+        `safety_blocked_before_provider:${safety.map((s) => s.code).join(",")}`,
+      );
       diagnostics.schemaPassed = true;
       diagnostics.evidenceTraceableCount = countEvidenceMessages(fallback);
       return { result: fallback, diagnostics };
@@ -841,20 +843,36 @@ function postValidateProviderResult(
   }
   const res = parsed.data;
 
-  if (res.intent !== "risk" && res.safety_flags.length === 0) {
-    const safety = detectSafety(request);
-    if (safety.length > 0) {
-      diagnostics.unsafeCandidatesRejected.push(`missing_safety:${safety.map((s) => s.code).join(",")}`);
-      (res as AnalysisResult).safety_flags = safety;
-      (res as AnalysisResult).recommended_next_action = "safe_stop";
-      (res as AnalysisResult).intent = "risk";
-      (res as AnalysisResult).stage_recommendation = "CLOSED";
-      (res as AnalysisResult).value_assessment = {
-        level: "unknown",
-        evidence_refs: [],
-        reason_codes: ["not_a_sales_signal"],
-      };
+  // P0 fix: always merge locally detected safety signals (defense in depth)
+  const localSafety = detectSafety(request);
+  if (localSafety.length > 0) {
+    const existingCodes = new Set(res.safety_flags.map((s) => s.code));
+    for (const flag of localSafety) {
+      if (!existingCodes.has(flag.code)) {
+        (res as AnalysisResult).safety_flags.push(flag);
+      }
     }
+    diagnostics.unsafeCandidatesRejected.push(
+      `post_validate_safety_merge:${localSafety.map((s) => s.code).join(",")}`,
+    );
+  }
+
+  // P0 fix: force safe action whenever any safety signal exists or intent is risk,
+  // regardless of provider's output
+  if (res.safety_flags.length > 0 || res.intent === "risk") {
+    if (res.recommended_next_action !== "safe_stop") {
+      diagnostics.unsafeCandidatesRejected.push(
+        `forced_safe_stop:provider_returned_${res.recommended_next_action}`,
+      );
+    }
+    (res as AnalysisResult).recommended_next_action = "safe_stop";
+    (res as AnalysisResult).intent = "risk";
+    (res as AnalysisResult).stage_recommendation = "CLOSED";
+    (res as AnalysisResult).value_assessment = {
+      level: "unknown",
+      evidence_refs: [],
+      reason_codes: ["not_a_sales_signal"],
+    };
   }
 
   if (res.value_assessment.level !== "unknown") {
