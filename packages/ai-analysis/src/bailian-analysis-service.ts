@@ -331,6 +331,22 @@ function detectSafety(request: AnalysisRequest): SafetyFlag[] {
     }
   }
 
+  // 7. Current quote free-text fields (material_tier / designer_tier)
+  if (request.context.current_quote) {
+    const q = request.context.current_quote;
+    const quoteRef: SourceRef = {
+      source_type: "quote",
+      source_id: q.quote_id,
+      excerpt: "",
+    };
+    if (typeof q.material_tier === "string") {
+      entries.push({ text: q.material_tier, ref: { ...quoteRef, excerpt: q.material_tier.slice(0, 60) } });
+    }
+    if (typeof q.designer_tier === "string") {
+      entries.push({ text: q.designer_tier, ref: { ...quoteRef, excerpt: q.designer_tier.slice(0, 60) } });
+    }
+  }
+
   // Scan all entries against safety rules (deduplicate by rule code)
   for (const { text, ref } of entries) {
     for (const rule of SAFETY_RULES) {
@@ -570,15 +586,48 @@ function deriveMissingFields(
   )
     return [];
 
-  // For provide_information: only flag inferred slots that need confirmation,
-  // not all missing required fields (customer is sharing info, not requesting quote)
+  // For provide_information: inferred slots need confirmation, plus any missing
+  // required quote fields — only allow prepare_quote when ALL quote-required fields
+  // are confirmed (context + this turn combined)
   if (intent === "provide_information") {
     const out: MissingField[] = [];
+    const seen = new Set<string>();
+
+    // Inferred slots need explicit confirmation
     for (const s of slotUpdates) {
-      if (s.status === "inferred") {
+      if (s.status === "inferred" && !seen.has(s.slot)) {
+        seen.add(s.slot);
         out.push({ slot: s.slot, reason: priority2Reason(s.slot), priority: 2 });
       }
     }
+
+    // Also check all required quote fields against combined confirmed set
+    const covered = new Set(
+      slotUpdates.filter((s) => s.status === "confirmed").map((s) => s.slot),
+    );
+    for (const f of request.context.confirmed_facts) {
+      if (f.status === "confirmed") covered.add(f.fact_key as SlotUpdate["slot"]);
+    }
+    const requiredHigh: SlotUpdate["slot"][] = ["city", "area_sqm"];
+    for (const s of requiredHigh) {
+      if (!covered.has(s) && !seen.has(s)) {
+        seen.add(s);
+        out.push({ slot: s, reason: priority1Reason(s), priority: 1 });
+      }
+    }
+    const requiredMid: SlotUpdate["slot"][] = [
+      "house_state",
+      "service_scope",
+      "material_tier",
+      "budget_max_fen",
+    ];
+    for (const s of requiredMid) {
+      if (!covered.has(s) && !seen.has(s)) {
+        seen.add(s);
+        out.push({ slot: s, reason: priority2Reason(s), priority: 2 });
+      }
+    }
+
     return out
       .sort((a, b) => (a.priority as number) - (b.priority as number))
       .slice(0, 3);

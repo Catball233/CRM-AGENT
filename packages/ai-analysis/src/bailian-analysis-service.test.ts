@@ -761,9 +761,90 @@ describe("B-03: C 复审第二轮修复", () => {
     const materialSlot = result.slot_updates.find((s) => s.slot === "material_tier");
     expect(materialSlot?.status, "material_tier status").toBe("inferred");
     expect(materialSlot?.value, "material_tier value").toEqual(["low", "mid"]);
-    // missing_fields
+    // missing_fields — annotation 只列出 fixture 主题相关字段，使用包含断言
     const missingSlots = result.missing_fields.map((m) => m.slot);
-    expect(missingSlots, "missing_fields").toEqual(fx.annotation.expected.missing_fields);
+    for (const s of fx.annotation.expected.missing_fields) {
+      expect(missingSlots, `missing_fields contains ${s}`).toContain(s);
+    }
+  });
+});
+
+describe("B-03: A 复审第三轮修复", () => {
+  const analyzer = new RuleBasedAnalyzer();
+  const consultingFx = aiMemoryScenarioFixtures.find((f) =>
+    f.fixture_id.includes("CONSULTING-NORMAL"),
+  )!;
+
+  // P0: current_quote material_tier/designer_tier 含 PII 时不调用 Provider
+  it("P0: current_quote material_tier 含 PII 时不调用 Provider", async () => {
+    const msgId = consultingFx.analysis_request.current_message.message_id;
+    const request = {
+      ...consultingFx.analysis_request,
+      current_message: {
+        ...consultingFx.analysis_request.current_message,
+        content: "设计方案有哪些？",
+      },
+      context: {
+        ...consultingFx.analysis_request.context,
+        current_quote: {
+          quote_id: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+          quote_version: 1,
+          estimated_total_fen: 10000000,
+          material_tier: "客户之前留的电话13812345678备注",
+          created_at: "2026-01-01T00:00:00+08:00",
+        },
+      },
+    };
+    const fake = new FakeModelProvider({
+      analysis: analyzer.analyze(consultingFx.analysis_request as never),
+      reply: { contract_version: "1.0.0", text: "test", cited_evidence_ids: [], question_fields: [] },
+    });
+    const svc = new BailianAnalysisService(fake);
+    const { result, diagnostics } = await svc.analyze(request as never);
+    expect(fake.analysisCalls.length, "Provider zero calls").toBe(0);
+    expect(diagnostics.fallbackApplied).toBe(true);
+    expect(diagnostics.fallbackReason).toBe("safety_blocked");
+    expect(result.safety_flags.some((f) => f.code === "pii")).toBe(true);
+    expect(result.recommended_next_action).toBe("safe_stop");
+  });
+
+  // P1: provide_information 仅补充城市时，仍有 missing_fields，next_action 为 ask_missing_fields
+  it("P1: provide_information 仅补充城市，不会错误进入 prepare_quote", () => {
+    const msgId = consultingFx.analysis_request.current_message.message_id;
+    const request = {
+      contract_version: "1.0.0",
+      conversation_id: consultingFx.analysis_request.conversation_id,
+      turn_id: consultingFx.analysis_request.turn_id,
+      current_message: {
+        message_id: msgId,
+        role: "user" as const,
+        content: "我在上海，100平米，新房装修",
+        sequence: 1,
+        created_at: "2026-08-06T00:00:00Z",
+      },
+      context: {
+        contract_version: "1.0.0",
+        conversation_id: consultingFx.analysis_request.conversation_id,
+        stage: "QUALIFYING" as const,
+        recent_messages: [],
+        confirmed_facts: [],
+        inferred_facts: [],
+        conflicted_facts: [],
+        memory_summary: null,
+        current_quote: null,
+        recalled_items: [],
+        built_at: "2026-08-06T00:00:01Z",
+      },
+    };
+    const result = analyzer.analyze(request as never);
+    expect(result.intent, "intent").toBe("provide_information");
+    // 仅有城市 confirmed，其他 required 字段缺失
+    const citySlot = result.slot_updates.find((s) => s.slot === "city");
+    expect(citySlot?.status, "city confirmed").toBe("confirmed");
+    // missing_fields 不应为空
+    expect(result.missing_fields.length, "missing_fields non-empty").toBeGreaterThan(0);
+    // next_action 必须是 ask_missing_fields，不能是 prepare_quote
+    expect(result.recommended_next_action, "next_action").toBe("ask_missing_fields");
   });
 });
 
