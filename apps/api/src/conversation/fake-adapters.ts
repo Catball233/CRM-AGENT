@@ -1,3 +1,4 @@
+import { randomUUID } from "node:crypto";
 import {
   AnalysisRequestSchema,
   AnalysisResultSchema,
@@ -5,6 +6,7 @@ import {
   CONTRACT_VERSION,
   ConversationSnapshotSchema,
   ConversationViewSchema,
+  CustomerFactSchema,
   IdSchema,
   KnowledgeSearchRequestSchema,
   KnowledgeSearchResultSchema,
@@ -27,8 +29,6 @@ import type {
 import { ModelUnavailableError } from "./errors";
 
 const LOCAL_TEST_CONTRACT_VERSION = CONTRACT_VERSION;
-const FAKE_BUILT_AT = "2026-08-05T00:00:00.000Z";
-
 interface StoredConversation {
   contract_version: typeof LOCAL_TEST_CONTRACT_VERSION;
   snapshot: ReturnType<typeof ConversationSnapshotSchema.parse>;
@@ -96,6 +96,9 @@ export class FakeAiProvider implements AiProvider {
     const request = AnalysisRequestSchema.parse(input);
     const source = { source_type: "message" as const, source_id: request.current_message.message_id };
     const content = request.current_message.content;
+    if (/模拟慢模型/u.test(content)) {
+      await new Promise((resolve) => setTimeout(resolve, 300));
+    }
     if (/模拟模型失败/u.test(content)) {
       throw new ModelUnavailableError();
     }
@@ -132,7 +135,7 @@ export class FakeAiProvider implements AiProvider {
           ? {
               contract_version: LOCAL_TEST_CONTRACT_VERSION,
               intent: "quote_request",
-              stage_recommendation: "QUOTING",
+              stage_recommendation: this.quoteStageFor(request.context.stage),
               value_assessment: {
                 level: "medium",
                 evidence_refs: [{ ...source, excerpt: content.slice(0, 100) }],
@@ -165,7 +168,7 @@ export class FakeAiProvider implements AiProvider {
           ? {
               contract_version: LOCAL_TEST_CONTRACT_VERSION,
               intent: "quote_request",
-              stage_recommendation: "QUALIFYING",
+              stage_recommendation: this.missingFieldStageFor(request.context.stage),
               value_assessment: {
                 level: "medium",
                 evidence_refs: [{ ...source, excerpt: content.slice(0, 100) }],
@@ -215,18 +218,55 @@ export class FakeAiProvider implements AiProvider {
   async compose_reply(input: Parameters<AiProvider["compose_reply"]>[0]) {
     const request = ReplyGenerationRequestSchema.parse(input);
     const isSafeStop = request.analysis.recommended_next_action === "safe_stop";
-    const isQuestion = request.analysis.recommended_next_action === "ask_missing_fields";
+    const isQuestion =
+      request.analysis.recommended_next_action === "ask_missing_fields" ||
+      request.analysis.recommended_next_action === "clarify_conflict";
+    const unavailable = request.quote_outcome?.kind === "unavailable" ? request.quote_outcome.unavailable : null;
 
     return ReplyDraftSchema.parse({
       contract_version: LOCAL_TEST_CONTRACT_VERSION,
       text: isSafeStop
         ? "我无法提供内部信息或底价，但可以继续说明公开的本地测试服务范围。"
+        : unavailable !== null
+          ? unavailable.user_safe_message
         : isQuestion
           ? "为提供本地测试预估，请先确认服务地区。"
           : "这是本地测试回复；如需继续，请补充您的装修需求。",
       cited_evidence_ids: [],
       question_fields: isQuestion ? request.analysis.missing_fields.map((field) => field.slot).slice(0, 3) : [],
     });
+  }
+
+  private quoteStageFor(current: ReturnType<typeof ContextBundleSchema.parse>["stage"]) {
+    switch (current) {
+      case "DISCOVERY":
+        return "QUALIFYING" as const;
+      case "QUALIFYING":
+        return "QUOTING" as const;
+      case "QUOTING":
+        return "NEGOTIATION" as const;
+      case "NEGOTIATION":
+        return "QUOTING" as const;
+      case "COMPLETED":
+        return "NEGOTIATION" as const;
+      case "CLOSED":
+        return "CLOSED" as const;
+    }
+  }
+
+  private missingFieldStageFor(current: ReturnType<typeof ContextBundleSchema.parse>["stage"]) {
+    switch (current) {
+      case "DISCOVERY":
+      case "QUALIFYING":
+      case "QUOTING":
+        return "QUALIFYING" as const;
+      case "NEGOTIATION":
+        return "NEGOTIATION" as const;
+      case "COMPLETED":
+        return "NEGOTIATION" as const;
+      case "CLOSED":
+        return "CLOSED" as const;
+    }
   }
 }
 
@@ -257,21 +297,42 @@ export class FakeKnowledgeProvider implements KnowledgeProvider {
 }
 
 export class FakeMemoryService implements MemoryService {
+  private readonly factsByConversation = new Map<string, ReturnType<typeof CustomerFactSchema.parse>[]>();
+
+  constructor(private readonly conversations?: Pick<ConversationRepository, "get_snapshot">) {}
+
   async build_context(conversationId: string, currentMessageId: string) {
     const parsedConversationId = IdSchema.parse(conversationId);
     IdSchema.parse(currentMessageId);
+    const snapshot = await this.conversations?.get_snapshot(parsedConversationId);
+    const currentQuote = snapshot?.current_quote ?? null;
+    const facts = this.factsByConversation.get(parsedConversationId) ?? [];
     return ContextBundleSchema.parse({
       contract_version: LOCAL_TEST_CONTRACT_VERSION,
       conversation_id: parsedConversationId,
-      stage: "DISCOVERY",
-      recent_messages: [],
-      confirmed_facts: [],
-      inferred_facts: [],
-      conflicted_facts: [],
+      stage: snapshot?.conversation.stage ?? "DISCOVERY",
+      recent_messages: snapshot?.messages.slice(-20) ?? [],
+      confirmed_facts: facts.filter((fact) => fact.status === "confirmed"),
+      inferred_facts: facts.filter((fact) => fact.status === "inferred"),
+      conflicted_facts: facts.filter((fact) => fact.status === "conflicted"),
       memory_summary: null,
-      current_quote: null,
+      current_quote:
+        currentQuote === null
+          ? null
+          : {
+              quote_id: currentQuote.quote_id,
+              quote_version: currentQuote.quote_version,
+              estimated_total_fen: currentQuote.estimated_total_fen,
+              ...(currentQuote.parameters_snapshot.material_tier === undefined
+                ? {}
+                : { material_tier: currentQuote.parameters_snapshot.material_tier }),
+              ...(currentQuote.parameters_snapshot.designer_tier === undefined
+                ? {}
+                : { designer_tier: currentQuote.parameters_snapshot.designer_tier }),
+              created_at: currentQuote.created_at,
+            },
       recalled_items: [],
-      built_at: FAKE_BUILT_AT,
+      built_at: new Date().toISOString(),
     });
   }
 
@@ -283,32 +344,69 @@ export class FakeMemoryService implements MemoryService {
     if (context.conversation_id !== conversationId) {
       throw new Error("Memory context belongs to another conversation");
     }
-    void analysis;
+    const factUpserts = analysis.slot_updates.map((update) =>
+        CustomerFactSchema.parse({
+          fact_id: randomUUID(),
+          fact_key: update.slot,
+          category: "requirement",
+          value: update.value,
+          status: update.status,
+          source_refs: update.source_refs,
+          updated_at: new Date().toISOString(),
+        }),
+      );
+    const factIdsToMarkConflicted = analysis.slot_updates
+      .filter((update) => update.status === "conflicted")
+      .flatMap((update) =>
+        update.conflicts_with_fact_ids ?? context.confirmed_facts
+          .filter((fact) => fact.fact_key === update.slot)
+          .map((fact) => fact.fact_id),
+      );
     return MemoryMutationPlanSchema.parse({
       contract_version: LOCAL_TEST_CONTRACT_VERSION,
       conversation_id: conversationId,
       turn_id: turnId,
-      fact_upserts: [],
-      fact_ids_to_mark_conflicted: [],
+      fact_upserts: factUpserts,
+      fact_ids_to_mark_conflicted: [...new Set(factIdsToMarkConflicted)],
       summary_upsert: null,
     });
+  }
+
+  async apply_mutation(input: Parameters<MemoryService["apply_mutation"]>[0]) {
+    const plan = MemoryMutationPlanSchema.parse(input);
+    const conflictedIds = new Set(plan.fact_ids_to_mark_conflicted);
+    let facts = (this.factsByConversation.get(plan.conversation_id) ?? []).map((fact) =>
+      conflictedIds.has(fact.fact_id) ? { ...fact, status: "conflicted" as const } : fact,
+    );
+    for (const fact of plan.fact_upserts) {
+      if (fact.status === "confirmed") {
+        facts = facts.filter((existing) => existing.fact_key !== fact.fact_key);
+      }
+      facts.push(fact);
+    }
+    this.factsByConversation.set(plan.conversation_id, facts);
   }
 }
 
 export class FakeQuoteService implements QuoteService {
+  private readonly versionsByQuoteId = new Map<string, number>();
+
   async calculate(input: Parameters<QuoteService["calculate"]>[0]) {
     const request = QuoteRequestSchema.parse(input);
     const amountFen = 1_000_000;
     const ruleId = request.candidate_rule_ids[0]!;
 
-    return QuoteOutcomeSchema.parse({
+    const quoteVersion = request.parent_quote_id === undefined
+      ? 1
+      : (this.versionsByQuoteId.get(request.parent_quote_id) ?? 0) + 1;
+    const outcome = QuoteOutcomeSchema.parse({
       kind: "quote",
       quote: {
         contract_version: LOCAL_TEST_CONTRACT_VERSION,
         quote_id: request.turn_id,
         conversation_id: request.conversation_id,
-        quote_version: 1,
-        parent_quote_id: null,
+        quote_version: quoteVersion,
+        parent_quote_id: request.parent_quote_id ?? null,
         status: "estimated",
         currency: "CNY",
         parameters_snapshot: request.confirmed_parameters,
@@ -332,6 +430,10 @@ export class FakeQuoteService implements QuoteService {
         created_at: request.requested_at,
       },
     });
+    if (outcome.kind === "quote") {
+      this.versionsByQuoteId.set(outcome.quote.quote_id, outcome.quote.quote_version);
+    }
+    return outcome;
   }
 }
 

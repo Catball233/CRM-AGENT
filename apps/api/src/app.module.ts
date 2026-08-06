@@ -17,6 +17,7 @@ import {
   MEMORY_SERVICE,
   QUOTE_SERVICE,
 } from "./conversation/tokens";
+import type { ConversationRepository } from "./conversation/ports";
 
 @Module({
   controllers: [AppController],
@@ -24,7 +25,11 @@ import {
     { provide: CONVERSATION_REPOSITORY, useClass: FakeConversationRepository },
     { provide: AI_PROVIDER, useClass: FakeAiProvider },
     { provide: KNOWLEDGE_PROVIDER, useClass: FakeKnowledgeProvider },
-    { provide: MEMORY_SERVICE, useClass: FakeMemoryService },
+    {
+      provide: MEMORY_SERVICE,
+      inject: [CONVERSATION_REPOSITORY],
+      useFactory: (conversations: ConversationRepository) => new FakeMemoryService(conversations),
+    },
     { provide: QUOTE_SERVICE, useClass: FakeQuoteService },
     { provide: API_LOGGER, useClass: FakeApiLogger },
     ConversationService,
