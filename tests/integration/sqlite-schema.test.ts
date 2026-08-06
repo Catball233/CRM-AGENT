@@ -15,6 +15,7 @@ import {
   openDatabase,
   rebuildDatabase,
   seedDatabase,
+  verifyBusinessInvariants,
   verifyDatabase,
 } from "../../database/scripts/sqlite.mjs";
 
@@ -71,6 +72,189 @@ describe("SQLite schema, migrations, and seed", () => {
       expect(
         database.prepare("SELECT COUNT(*) AS count FROM quote_knowledge_evidence").get(),
       ).toEqual({ count: 1 });
+      expect(verifyBusinessInvariants(database)).toEqual({
+        businessInvariants: "ok",
+        quoteTotalViolations: 0,
+      });
+    } finally {
+      database.close();
+    }
+  });
+
+  it("requires UUID identifiers and ISO 8601 timestamps with an explicit offset", () => {
+    const database = openDatabase(join(temporaryDirectory(), "formats.sqlite"));
+    try {
+      migrateDatabase(database, migrationDirectory);
+
+      const insertConversation = database.prepare(`
+        INSERT INTO conversations (
+          conversation_id, stage, status, created_at, updated_at
+        ) VALUES (?, 'DISCOVERY', 'ACTIVE', ?, ?)
+      `);
+
+      expect(() =>
+        insertConversation.run(
+          "not-a-uuid-but-padded-to-36-characters",
+          "2026-08-05T09:00:00Z",
+          "2026-08-05T09:00:00Z",
+        ),
+      ).toThrow();
+      expect(() =>
+        insertConversation.run(
+          "20000000-0000-9000-c000-000000000001",
+          "2026-08-05T09:00:00Z",
+          "2026-08-05T09:00:00Z",
+        ),
+      ).toThrow();
+      expect(() =>
+        insertConversation.run(
+          "20000000-0000-4000-8000-000000000001",
+          "2026-08-05T09:00:00",
+          "2026-08-05T09:00:00",
+        ),
+      ).toThrow();
+
+      expect(
+        insertConversation.run(
+          "20000000-0000-4000-8000-000000000002",
+          "2026-08-05T17:00:00+08:00",
+          "2026-08-05T17:00:01+08:00",
+        ).changes,
+      ).toBe(1);
+    } finally {
+      database.close();
+    }
+  });
+
+  it("prevents turns, parent quotes, and evidence from crossing conversation boundaries", () => {
+    const database = openDatabase(join(temporaryDirectory(), "conversation-boundaries.sqlite"));
+    try {
+      migrateDatabase(database, migrationDirectory);
+      seedDatabase(database, seedDirectory);
+
+      database
+        .prepare(`
+          INSERT INTO conversations (
+            conversation_id, stage, status, created_at, updated_at
+          ) VALUES (?, 'QUOTING', 'ACTIVE', ?, ?)
+        `)
+        .run(
+          "20000000-0000-4000-8000-000000000010",
+          "2026-08-05T09:00:00Z",
+          "2026-08-05T09:00:01Z",
+        );
+      database
+        .prepare(`
+          INSERT INTO turns (
+            turn_id, conversation_id, client_message_id, status, outcome, started_at, completed_at
+          ) VALUES (?, ?, ?, 'COMPLETED', 'quote', ?, ?)
+        `)
+        .run(
+          "20000000-0000-4000-8000-000000000011",
+          "20000000-0000-4000-8000-000000000010",
+          "20000000-0000-4000-8000-000000000012",
+          "2026-08-05T09:00:00Z",
+          "2026-08-05T09:00:01Z",
+        );
+
+      expect(() =>
+        database
+          .prepare(`
+            INSERT INTO messages (
+              message_id, conversation_id, turn_id, role, content, sequence, created_at
+            ) VALUES (?, ?, ?, 'user', 'cross-conversation message', 1, ?)
+          `)
+          .run(
+            "20000000-0000-4000-8000-000000000013",
+            "20000000-0000-4000-8000-000000000010",
+            "10000000-0000-4000-8000-000000000002",
+            "2026-08-05T09:00:01Z",
+          ),
+      ).toThrow();
+
+      expect(() =>
+        database
+          .prepare(`
+            INSERT INTO knowledge_evidence (
+              evidence_id, conversation_id, turn_id, knowledge_base_id, document_id,
+              document_version, chunk_id, title, excerpt, score, created_at
+            ) VALUES (?, ?, ?, 'kb-test', 'doc-test', '1.0.0', 'chunk-test',
+              'test evidence', 'cross-conversation evidence', 0.9, ?)
+          `)
+          .run(
+            "20000000-0000-4000-8000-000000000014",
+            "20000000-0000-4000-8000-000000000010",
+            "10000000-0000-4000-8000-000000000002",
+            "2026-08-05T09:00:01Z",
+          ),
+      ).toThrow();
+
+      const insertQuote = database.prepare(`
+        INSERT INTO quote_versions (
+          quote_id, conversation_id, turn_id, quote_version, parent_quote_id,
+          parameters_json, estimated_total_fen, disclaimer, created_at
+        ) VALUES (?, ?, ?, 1, ?, '{}', 0, 'fictional test quote', ?)
+      `);
+      expect(() =>
+        insertQuote.run(
+          "20000000-0000-4000-8000-000000000015",
+          "20000000-0000-4000-8000-000000000010",
+          "10000000-0000-4000-8000-000000000002",
+          null,
+          "2026-08-05T09:00:01Z",
+        ),
+      ).toThrow();
+      expect(() =>
+        insertQuote.run(
+          "20000000-0000-4000-8000-000000000016",
+          "20000000-0000-4000-8000-000000000010",
+          "20000000-0000-4000-8000-000000000011",
+          "10000000-0000-4000-8000-000000000009",
+          "2026-08-05T09:00:01Z",
+        ),
+      ).toThrow();
+
+      database
+        .prepare(`
+          INSERT INTO knowledge_evidence (
+            evidence_id, conversation_id, turn_id, knowledge_base_id, document_id,
+            document_version, chunk_id, title, excerpt, score, created_at
+          ) VALUES (?, ?, ?, 'kb-test', 'doc-test', '1.0.0', 'chunk-test',
+            'test evidence', 'same-conversation evidence', 0.9, ?)
+        `)
+        .run(
+          "20000000-0000-4000-8000-000000000017",
+          "20000000-0000-4000-8000-000000000010",
+          "20000000-0000-4000-8000-000000000011",
+          "2026-08-05T09:00:01Z",
+        );
+      expect(() =>
+        database
+          .prepare(`
+            INSERT INTO quote_knowledge_evidence (quote_id, evidence_id, conversation_id)
+            VALUES (?, ?, ?)
+          `)
+          .run(
+            "10000000-0000-4000-8000-000000000009",
+            "20000000-0000-4000-8000-000000000017",
+            "10000000-0000-4000-8000-000000000001",
+          ),
+      ).toThrow();
+    } finally {
+      database.close();
+    }
+  });
+
+  it("checks quote totals as a business invariant independently of SQLite integrity", () => {
+    const database = openDatabase(join(temporaryDirectory(), "business-invariants.sqlite"));
+    try {
+      migrateDatabase(database, migrationDirectory);
+      seedDatabase(database, seedDirectory);
+
+      expect(verifyDatabase(database)).toMatchObject({ integrity: "ok", foreignKeyViolations: 0 });
+      database.prepare("UPDATE quote_versions SET estimated_total_fen = 800001").run();
+      expect(verifyDatabase(database)).toMatchObject({ integrity: "ok", foreignKeyViolations: 0 });
+      expect(() => verifyBusinessInvariants(database)).toThrow(/Quote total does not match item total/);
     } finally {
       database.close();
     }
