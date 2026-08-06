@@ -67,7 +67,7 @@ export function removeRecentConversation(
   return {
     activeConversationId:
       index.activeConversationId === conversationId
-        ? (conversations[0]?.conversationId ?? null)
+        ? null
         : index.activeConversationId,
     conversations,
   };

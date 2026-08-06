@@ -108,4 +108,32 @@ describe("D-02 chat event reducer", () => {
       }),
     ).toThrow("终止结果与事件会话不一致");
   });
+
+  it("rejects cross-request and cross-message event mixing", () => {
+    const first = quoteReadyEventStream[0]!;
+    const wrongClientMessageId = "ffffffff-ffff-4fff-8fff-ffffffffffff";
+    const requestState = createChatStreamState(
+      first.conversation_id,
+      wrongClientMessageId,
+    );
+
+    expect(() => reduceChatEvent(requestState, first)).toThrow(
+      "接收事件与当前请求不一致",
+    );
+
+    const beforeComplete = consume(quoteReadyEventStream.slice(0, 3));
+    const quoteReady = quoteReadyEventStream[3]!;
+    expect(() =>
+      reduceChatEvent(beforeComplete, {
+        ...quoteReady,
+        payload: {
+          ...quoteReady.payload,
+          message: {
+            ...quoteReady.payload.message,
+            message_id: wrongClientMessageId,
+          },
+        },
+      }),
+    ).toThrow("完整回复与消息增量不一致");
+  });
 });

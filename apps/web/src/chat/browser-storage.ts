@@ -30,9 +30,18 @@ let memoryFallback: Storage | null = null;
 
 export function getBrowserStorage(): Storage {
   try {
-    if (window.localStorage) return window.localStorage;
+    const storage = window.localStorage;
+    const probeKey = "crm-agent.d02.storage-probe";
+    const previousValue = storage.getItem(probeKey);
+    storage.setItem(probeKey, "available");
+    if (previousValue === null) {
+      storage.removeItem(probeKey);
+    } else {
+      storage.setItem(probeKey, previousValue);
+    }
+    return storage;
   } catch {
-    // Restricted or privacy-focused browsers may disable localStorage entirely.
+    // Restricted or privacy-focused browsers may expose but reject localStorage.
   }
 
   memoryFallback ??= new MemoryStorage();

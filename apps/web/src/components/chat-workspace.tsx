@@ -31,6 +31,21 @@ const SUGGESTED_PROMPTS = [
   "环保材料和施工工期需要注意什么？",
 ] as const;
 
+const SENSITIVE_INPUT_PATTERNS = [
+  /(?:^|\D)1[3-9]\d{9}(?:\D|$)/,
+  /(?:^|\D)\d{17}[\dXx](?:\D|$)/,
+  /\b[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}\b/i,
+  /\b(?:api[_ -]?key|access[_ -]?key|secret|token)\s*[:=]\s*\S+/i,
+  /\bsk-[A-Za-z0-9_-]{12,}\b/,
+] as const;
+
+const SENSITIVE_INPUT_MESSAGE =
+  "请勿输入真实手机号、身份证号、邮箱、密钥或其他敏感信息；请改用虚构或脱敏测试数据。";
+
+function containsSensitiveInput(content: string) {
+  return SENSITIVE_INPUT_PATTERNS.some((pattern) => pattern.test(content));
+}
+
 const INTENT_LABELS: Record<string, string> = {
   greeting: "问候",
   consulting: "装修咨询",
@@ -101,6 +116,8 @@ export function ChatWorkspace({ gateway: providedGateway }: ChatWorkspaceProps) 
   const [sessionPanelOpen, setSessionPanelOpen] = useState(false);
   const [clearDialogOpen, setClearDialogOpen] = useState(false);
   const messageEndRef = useRef<HTMLDivElement>(null);
+  const createInFlightRef = useRef(false);
+  const sendInFlightRef = useRef(false);
 
   useEffect(() => {
     const browserStorage = getBrowserStorage();
@@ -153,7 +170,15 @@ export function ChatWorkspace({ gateway: providedGateway }: ChatWorkspaceProps) 
   }, [snapshot?.messages.length, pendingContent, streamedText]);
 
   const createConversation = useCallback(async () => {
-    if (!gateway || !storage || status === "sending") return;
+    if (
+      !gateway ||
+      !storage ||
+      status === "sending" ||
+      createInFlightRef.current
+    ) {
+      return;
+    }
+    createInFlightRef.current = true;
     setStatus("loading");
     setError(null);
     setAnalysis(null);
@@ -171,21 +196,39 @@ export function ChatWorkspace({ gateway: providedGateway }: ChatWorkspaceProps) 
     } catch (createError) {
       setError(getSafeErrorMessage(createError));
     } finally {
+      createInFlightRef.current = false;
       setStatus("ready");
     }
   }, [gateway, persistIndex, status, storage]);
 
   const sendMessage = useCallback(async () => {
     const content = draft.trim();
-    if (!gateway || !snapshot || !storage || !content || status === "sending") return;
+    if (
+      !gateway ||
+      !snapshot ||
+      !storage ||
+      !content ||
+      status === "sending" ||
+      sendInFlightRef.current
+    ) {
+      return;
+    }
+    if (containsSensitiveInput(content)) {
+      setError(SENSITIVE_INPUT_MESSAGE);
+      return;
+    }
 
+    sendInFlightRef.current = true;
     setStatus("sending");
     setError(null);
     setDraft("");
     setPendingContent(content);
     setStreamedText("");
     const clientMessageId = createClientId();
-    let streamState = createChatStreamState(snapshot.conversation.conversation_id);
+    let streamState = createChatStreamState(
+      snapshot.conversation.conversation_id,
+      clientMessageId,
+    );
 
     try {
       for await (const event of gateway.sendMessage(snapshot.conversation.conversation_id, {
@@ -222,6 +265,7 @@ export function ChatWorkspace({ gateway: providedGateway }: ChatWorkspaceProps) 
     } catch (sendError) {
       setError(getSafeErrorMessage(sendError));
     } finally {
+      sendInFlightRef.current = false;
       setPendingContent(null);
       setStreamedText("");
       setStatus("ready");

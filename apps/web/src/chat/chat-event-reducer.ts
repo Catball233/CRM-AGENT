@@ -16,7 +16,9 @@ type TerminalError = Extract<ChatEvent, { event_type: "turn.failed" }>["payload"
 
 export interface ChatStreamState {
   conversationId: string;
+  clientMessageId: string | null;
   turnId: string | null;
+  messageId: string | null;
   lastSequence: number;
   nextDeltaIndex: number;
   accepted: boolean;
@@ -29,10 +31,15 @@ export interface ChatStreamState {
   error: TerminalError | null;
 }
 
-export function createChatStreamState(conversationId: string): ChatStreamState {
+export function createChatStreamState(
+  conversationId: string,
+  clientMessageId: string | null = null,
+): ChatStreamState {
   return {
     conversationId,
+    clientMessageId,
     turnId: null,
+    messageId: null,
     lastSequence: 0,
     nextDeltaIndex: 0,
     accepted: false,
@@ -84,6 +91,12 @@ export function reduceChatEvent(
   switch (event.event_type) {
     case "turn.accepted":
       if (state.accepted) return protocolError("重复接收 turn.accepted");
+      if (
+        state.clientMessageId !== null &&
+        event.payload.client_message_id !== state.clientMessageId
+      ) {
+        return protocolError("接收事件与当前请求不一致");
+      }
       return { ...next, accepted: true };
     case "analysis.completed":
       if (!state.accepted) return protocolError("分析事件早于接收事件");
@@ -92,26 +105,38 @@ export function reduceChatEvent(
       return { ...next, analysis: event.payload };
     case "message.delta":
       if (state.responseCommitted) return protocolError("回复完成后仍收到消息增量");
+      if (state.messageId !== null && event.payload.message_id !== state.messageId) {
+        return protocolError("同一事件流出现多个消息 ID");
+      }
       if (event.payload.index !== state.nextDeltaIndex) {
         return protocolError("消息增量索引不连续");
       }
       return {
         ...next,
+        messageId: state.messageId ?? event.payload.message_id,
         nextDeltaIndex: state.nextDeltaIndex + 1,
         streamedText: state.streamedText + event.payload.delta,
       };
     case "question.required":
     case "message.completed":
       if (state.responseCommitted) return protocolError("同一事件流出现多个完整回复");
+      if (state.messageId !== null && event.payload.message.message_id !== state.messageId) {
+        return protocolError("完整回复与消息增量不一致");
+      }
       return {
         ...next,
+        messageId: event.payload.message.message_id,
         responseCommitted: true,
         assistantMessage: event.payload.message,
       };
     case "quote.ready":
       if (state.responseCommitted) return protocolError("同一事件流出现多个完整回复");
+      if (state.messageId !== null && event.payload.message.message_id !== state.messageId) {
+        return protocolError("完整回复与消息增量不一致");
+      }
       return {
         ...next,
+        messageId: event.payload.message.message_id,
         responseCommitted: true,
         assistantMessage: event.payload.message,
       };
@@ -122,8 +147,21 @@ export function reduceChatEvent(
       ) {
         return protocolError("终止结果与事件会话不一致");
       }
+      if (
+        state.clientMessageId !== null &&
+        event.payload.result.client_message_id !== state.clientMessageId
+      ) {
+        return protocolError("终止结果与当前请求不一致");
+      }
+      if (
+        state.messageId !== null &&
+        event.payload.result.assistant_message.message_id !== state.messageId
+      ) {
+        return protocolError("终止结果与完整回复不一致");
+      }
       return {
         ...next,
+        messageId: event.payload.result.assistant_message.message_id,
         terminal: "completed",
         result: event.payload.result,
         assistantMessage: event.payload.result.assistant_message,
