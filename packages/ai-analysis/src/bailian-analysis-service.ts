@@ -1157,8 +1157,9 @@ function postValidateProviderResult(
   // C P1-1: 报价条件完整性是权威门控，不允许 Provider 把 missing_fields 空数组谎称为 complete
   // 当意图为 provide_information / quote_request / negotiation / plan_adjustment 且
   // Provider 声称 prepare_quote / adjust_quote 时，强制用本地 deriveMissingFields 重新计算
-  // 缺失报价必要字段（city / area_sqm / house_state / service_scope / material_tier / budget_max_fen），
-  // 不接受 Provider 的 missing_fields。
+  // 缺失报价必要字段（city / area_sqm / house_state / service_scope / material_tier / budget_max_fen）。
+  // 关键：只依赖 request.context.confirmed_facts 和本地确定性抽取的槽位（extractSlotUpdates），
+  // 不接受 Provider 的 res.slot_updates —— Provider 可以伪造 confirmed 槽位绕过门控。
   const QUOTE_READINESS_INTENTS: Intent[] = [
     "provide_information",
     "quote_request",
@@ -1173,9 +1174,11 @@ function postValidateProviderResult(
     QUOTE_READINESS_INTENTS.includes(res.intent) &&
     QUOTE_ACTIONS.includes(res.recommended_next_action)
   ) {
+    // 本地确定性抽取的槽位，不受 Provider 影响
+    const localSlotUpdates = extractSlotUpdates(request);
     const authoritativeMissing = deriveMissingFields(
       res.intent,
-      res.slot_updates,
+      localSlotUpdates,
       request,
     );
     if (authoritativeMissing.length !== res.missing_fields.length) {
