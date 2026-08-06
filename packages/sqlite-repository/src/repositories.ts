@@ -1,21 +1,30 @@
+import { createHash, randomUUID } from "node:crypto";
 import type { DatabaseSync } from "node:sqlite";
 import {
+  AnalysisResultSchema,
   ConversationViewSchema,
   ConversationSnapshotSchema,
   CustomerFactSchema,
   IdSchema,
+  KnowledgeEvidenceSchema,
   MemorySummaryViewSchema,
   MessageViewSchema,
   QuoteResultSchema,
   RuleDefinitionSchema,
+  type AssistantMessageView,
   type ConversationView,
   type CustomerFact,
+  type KnowledgeEvidence,
   type MessageView,
   type QuoteResult,
+  type SourceRef,
 } from "@crm-agent/contracts";
 import {
   ActivateRuleInputSchema,
+  BeginTurnInputSchema,
+  CompleteTurnInputSchema,
   ConversationFactInputSchema,
+  FailTurnInputSchema,
   MemoryStateSchema,
   PersistedTurnSchema,
   ResolvedRuleSetSchema,
@@ -23,7 +32,10 @@ import {
   SaveQuoteInputSchema,
   SaveTurnInputSchema,
   type ActivateRuleInput,
+  type BeginTurnInput,
+  type CompleteTurnInput,
   type ConversationFactInput,
+  type FailTurnInput,
   type MemoryState,
   type PersistedTurn,
   type RuleVersionRecord,
@@ -74,7 +86,12 @@ function parseJson(value: string, field: string): unknown {
   }
 }
 
+function hashContent(content: string): string {
+  return createHash("sha256").update(content).digest("hex");
+}
+
 function inTransaction<T>(database: DatabaseSync, operation: () => T): T {
+  if (database.isTransaction) return operation();
   database.exec("BEGIN IMMEDIATE");
   try {
     const result = operation();
@@ -83,6 +100,55 @@ function inTransaction<T>(database: DatabaseSync, operation: () => T): T {
   } catch (error) {
     database.exec("ROLLBACK");
     throw error;
+  }
+}
+
+function assertNoOtherProcessingTurn(database: DatabaseSync, conversationId: string, turnId?: string): void {
+  const row = database
+    .prepare(`SELECT turn_id FROM turns
+      WHERE conversation_id = ? AND status = 'PROCESSING' AND (? IS NULL OR turn_id <> ?)
+      LIMIT 1`)
+    .get(conversationId, turnId ?? null, turnId ?? null) as Row | undefined;
+  if (row) throw new Error("CONVERSATION_BUSY: another turn is already processing");
+}
+
+function assertSourceRefsBelongToConversation(
+  database: DatabaseSync,
+  conversationId: string,
+  refs: SourceRef[],
+): void {
+  const queries: Record<SourceRef["source_type"], string> = {
+    message: "SELECT 1 FROM messages WHERE message_id = ? AND conversation_id = ?",
+    memory_summary: "SELECT 1 FROM memory_summaries WHERE summary_id = ? AND conversation_id = ?",
+    knowledge_chunk: "SELECT 1 FROM knowledge_evidence WHERE evidence_id = ? AND conversation_id = ?",
+    quote: "SELECT 1 FROM quote_versions WHERE quote_id = ? AND conversation_id = ?",
+  };
+  for (const ref of refs) {
+    const found = database.prepare(queries[ref.source_type]).get(ref.source_id, conversationId);
+    if (!found) {
+      throw new Error(
+        `CROSS_CONVERSATION_REFERENCE: ${ref.source_type} ${ref.source_id} is not visible to ${conversationId}`,
+      );
+    }
+  }
+}
+
+function assertAssistantEvidenceBelongsToTurn(
+  database: DatabaseSync,
+  conversationId: string,
+  turnId: string,
+  message: AssistantMessageView,
+): void {
+  for (const evidenceId of message.cited_evidence_ids) {
+    const found = database
+      .prepare(`SELECT 1 FROM knowledge_evidence
+        WHERE evidence_id = ? AND conversation_id = ? AND turn_id = ?`)
+      .get(evidenceId, conversationId, turnId);
+    if (!found) {
+      throw new Error(
+        `CROSS_CONVERSATION_REFERENCE: cited evidence ${evidenceId} does not belong to the current turn`,
+      );
+    }
   }
 }
 
@@ -149,29 +215,146 @@ export class MessageRepository {
     private readonly hooks?: TransactionHooks,
   ) {}
 
+  beginTurn(input: BeginTurnInput): PersistedTurn {
+    const request = BeginTurnInputSchema.parse(input);
+    if (hashContent(request.content) !== request.content_hash) {
+      throw new Error("content_hash does not match the client message content");
+    }
+    const existing = this.findByClientMessageId(request.conversation_id, request.client_message_id);
+    if (existing) {
+      const clientMessage = existing.messages.find((message) => message.message_id === existing.client_message_id);
+      if (clientMessage?.content !== request.content || existing.content_hash !== request.content_hash) {
+        throw new Error("IDEMPOTENCY_KEY_REUSED: client_message_id has different content");
+      }
+      return existing;
+    }
+    const now = new Date().toISOString();
+    const nextSequenceRow = this.database
+      .prepare("SELECT COALESCE(MAX(sequence), 0) + 1 AS next_sequence FROM messages WHERE conversation_id = ?")
+      .get(request.conversation_id) as Row | undefined;
+    return this.saveTurn({
+      conversation_id: request.conversation_id,
+      turn_id: randomUUID(),
+      client_message_id: request.client_message_id,
+      content_hash: request.content_hash,
+      status: "PROCESSING",
+      started_at: now,
+      warnings: [],
+      messages: [{
+        message_id: request.client_message_id,
+        role: "user",
+        content: request.content,
+        sequence: numberValue(requiredRow(nextSequenceRow, "message sequence"), "next_sequence"),
+        created_at: now,
+      }],
+    });
+  }
+
   saveTurn(input: SaveTurnInput): PersistedTurn {
     const turn = SaveTurnInputSchema.parse(input);
+    const incomingClientMessage = turn.messages.find(
+      (message) => message.message_id === turn.client_message_id && message.role === "user",
+    );
+    if (!incomingClientMessage) throw new Error("client message is missing");
+    const contentHash = turn.content_hash ?? hashContent(incomingClientMessage.content);
+    if (contentHash !== hashContent(incomingClientMessage.content)) {
+      throw new Error("content_hash does not match the client message content");
+    }
     return inTransaction(this.database, () => {
-      const existing = this.findTurnId(turn.conversation_id, turn.client_message_id, turn.retry_request_id);
+      const existing = this.findTurnId(turn.conversation_id, turn.client_message_id);
       if (existing) {
         const persisted = this.getTurn(turn.conversation_id, existing);
         const storedClientMessage = persisted.messages.find(
           (message) => message.message_id === persisted.client_message_id,
         );
-        const incomingClientMessage = turn.messages.find(
-          (message) => message.message_id === turn.client_message_id,
-        );
-        if (storedClientMessage?.content !== incomingClientMessage?.content) {
+        if (storedClientMessage?.content !== incomingClientMessage.content || persisted.content_hash !== contentHash) {
           throw new Error("IDEMPOTENCY_KEY_REUSED: client_message_id has different content");
         }
-        return persisted;
+
+        if (turn.retry_request_id && persisted.status === "FAILED") {
+          if (turn.status !== "PROCESSING") {
+            throw new Error("retry must transition a FAILED turn back to PROCESSING");
+          }
+          assertNoOtherProcessingTurn(this.database, turn.conversation_id, persisted.turn_id);
+          const priorAttempt = this.database
+            .prepare(`SELECT turn_id FROM turn_retry_attempts
+              WHERE conversation_id = ? AND retry_request_id = ?`)
+            .get(turn.conversation_id, turn.retry_request_id) as Row | undefined;
+          if (priorAttempt && stringValue(priorAttempt, "turn_id") !== persisted.turn_id) {
+            throw new Error("IDEMPOTENCY_KEY_REUSED: retry_request_id belongs to another turn");
+          }
+          if (priorAttempt) return persisted;
+          this.database.prepare(`INSERT INTO turn_retry_attempts (
+            turn_id, conversation_id, retry_request_id, attempt_number, status, started_at
+          ) VALUES (?, ?, ?, ?, 'PROCESSING', ?)`)
+            .run(
+              persisted.turn_id,
+              turn.conversation_id,
+              turn.retry_request_id,
+              persisted.attempt_count + 1,
+              turn.started_at,
+            );
+          this.database.prepare(`UPDATE turns SET
+            retry_request_id = ?, status = 'PROCESSING', outcome = NULL,
+            completed_at = NULL, failure_code = NULL, failure_retryable = NULL,
+            warnings_json = ?, attempt_count = attempt_count + 1
+            WHERE turn_id = ? AND conversation_id = ? AND status = 'FAILED'`)
+            .run(turn.retry_request_id, JSON.stringify(turn.warnings), persisted.turn_id, turn.conversation_id);
+          this.hooks?.afterStep?.("message_save", "turn_retry_started");
+          return this.getTurn(turn.conversation_id, persisted.turn_id);
+        }
+
+        if (persisted.status === "PROCESSING" && turn.status !== "PROCESSING") {
+          if (turn.turn_id !== persisted.turn_id) {
+            throw new Error("turn_id cannot change while completing a processing turn");
+          }
+          this.insertMissingMessages(turn.conversation_id, persisted.turn_id, turn.messages);
+          const result = this.database.prepare(`UPDATE turns SET
+            status = ?, outcome = ?, completed_at = ?, failure_code = ?,
+            failure_retryable = ?, warnings_json = ?
+            WHERE turn_id = ? AND conversation_id = ? AND status = 'PROCESSING'`)
+            .run(
+              turn.status,
+              turn.outcome ?? null,
+              turn.completed_at ?? null,
+              turn.failure_code ?? null,
+              turn.status === "FAILED" ? 1 : null,
+              JSON.stringify(turn.warnings),
+              persisted.turn_id,
+              turn.conversation_id,
+            );
+          if (result.changes !== 1) throw new Error("turn state transition lost its PROCESSING precondition");
+          if (persisted.retry_request_id) {
+            this.database.prepare(`UPDATE turn_retry_attempts SET status = ?, finished_at = ?
+              WHERE turn_id = ? AND retry_request_id = ? AND status = 'PROCESSING'`)
+              .run(turn.status, turn.completed_at ?? null, persisted.turn_id, persisted.retry_request_id);
+          }
+          this.updateConversationTimestamp(turn.conversation_id, turn.messages, turn.completed_at ?? turn.started_at);
+          this.hooks?.afterStep?.("message_save", "turn_state_updated");
+          return this.getTurn(turn.conversation_id, persisted.turn_id);
+        }
+
+        if (persisted.status === "FAILED" && !turn.retry_request_id) {
+          throw new Error("TURN_RETRY_REQUIRED: failed turn requires retry_request_id");
+        }
+        if (persisted.status === turn.status) return persisted;
+        if (persisted.status === "COMPLETED") return persisted;
+        throw new Error(`invalid turn transition ${persisted.status} -> ${turn.status}`);
+      }
+
+      if (turn.retry_request_id) {
+        throw new Error("retry_request_id cannot create a new turn");
+      }
+      if (turn.status === "PROCESSING") {
+        assertNoOtherProcessingTurn(this.database, turn.conversation_id);
       }
 
       this.database
         .prepare(`INSERT INTO turns (
           turn_id, conversation_id, client_message_id, retry_request_id, status, outcome,
-          started_at, completed_at, failure_code, warnings_json
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`)
+          started_at, completed_at, failure_code, warnings_json, content_hash, attempt_count,
+          failure_retryable
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?)`)
         .run(
           turn.turn_id,
           turn.conversation_id,
@@ -183,35 +366,15 @@ export class MessageRepository {
           turn.completed_at ?? null,
           turn.failure_code ?? null,
           JSON.stringify(turn.warnings),
+          contentHash,
+          turn.status === "FAILED" ? 1 : null,
         );
       this.hooks?.afterStep?.("message_save", "turn_inserted");
 
-      const insertMessage = this.database.prepare(`INSERT INTO messages (
-        message_id, conversation_id, turn_id, role, content, sequence,
-        cited_evidence_ids_json, created_at
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`);
-      for (const message of turn.messages) {
-        insertMessage.run(
-          message.message_id,
-          turn.conversation_id,
-          turn.turn_id,
-          message.role,
-          message.content,
-          message.sequence,
-          JSON.stringify(message.role === "assistant" ? message.cited_evidence_ids : []),
-          message.created_at,
-        );
-      }
+      this.insertMissingMessages(turn.conversation_id, turn.turn_id, turn.messages);
       this.hooks?.afterStep?.("message_save", "messages_inserted");
 
-      const updatedAt = [...turn.messages.map((message) => message.created_at), turn.completed_at ?? turn.started_at]
-        .map((value) => ({ value, time: Date.parse(value) }))
-        .sort((left, right) => right.time - left.time)[0]?.value ?? turn.started_at;
-      this.database
-        .prepare(`UPDATE conversations SET updated_at = CASE
-          WHEN datetime(updated_at) < datetime(?) THEN ? ELSE updated_at END
-          WHERE conversation_id = ?`)
-        .run(updatedAt, updatedAt, turn.conversation_id);
+      this.updateConversationTimestamp(turn.conversation_id, turn.messages, turn.completed_at ?? turn.started_at);
 
       return this.getTurn(turn.conversation_id, turn.turn_id);
     });
@@ -229,7 +392,11 @@ export class MessageRepository {
       turn_id: stringValue(row, "turn_id"),
       conversation_id: stringValue(row, "conversation_id"),
       client_message_id: stringValue(row, "client_message_id"),
+      content_hash: stringValue(row, "content_hash") || hashContent(
+        this.listMessages(id).find((message) => message.message_id === stringValue(row, "client_message_id"))?.content ?? "",
+      ),
       retry_request_id: nullableString(row, "retry_request_id"),
+      attempt_count: numberValue(row, "attempt_count"),
       status: stringValue(row, "status"),
       outcome: nullableString(row, "outcome"),
       started_at: stringValue(row, "started_at"),
@@ -262,11 +429,59 @@ export class MessageRepository {
     return rows.map(mapMessage);
   }
 
-  private findTurnId(conversationId: string, clientMessageId: string, retryRequestId?: string): string | null {
+  private insertMissingMessages(conversationId: string, turnId: string, messages: MessageView[]): void {
+    const insertMessage = this.database.prepare(`INSERT INTO messages (
+      message_id, conversation_id, turn_id, role, content, sequence,
+      cited_evidence_ids_json, created_at
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`);
+    for (const message of messages) {
+      const existing = this.database
+        .prepare("SELECT conversation_id, turn_id, content FROM messages WHERE message_id = ?")
+        .get(message.message_id) as Row | undefined;
+      if (existing) {
+        if (
+          stringValue(existing, "conversation_id") !== conversationId ||
+          stringValue(existing, "turn_id") !== turnId ||
+          stringValue(existing, "content") !== message.content
+        ) {
+          throw new Error("message_id already exists with a different immutable payload");
+        }
+        continue;
+      }
+      if (message.role === "assistant") {
+        assertAssistantEvidenceBelongsToTurn(this.database, conversationId, turnId, message);
+      }
+      insertMessage.run(
+        message.message_id,
+        conversationId,
+        turnId,
+        message.role,
+        message.content,
+        message.sequence,
+        JSON.stringify(message.role === "assistant" ? message.cited_evidence_ids : []),
+        message.created_at,
+      );
+    }
+  }
+
+  private updateConversationTimestamp(
+    conversationId: string,
+    messages: MessageView[],
+    fallback: string,
+  ): void {
+    const updatedAt = [...messages.map((message) => message.created_at), fallback]
+      .map((value) => ({ value, time: Date.parse(value) }))
+      .sort((left, right) => right.time - left.time)[0]?.value ?? fallback;
+    this.database.prepare(`UPDATE conversations SET updated_at = CASE
+      WHEN datetime(updated_at) < datetime(?) THEN ? ELSE updated_at END
+      WHERE conversation_id = ?`)
+      .run(updatedAt, updatedAt, conversationId);
+  }
+
+  private findTurnId(conversationId: string, clientMessageId: string): string | null {
     const row = this.database
-      .prepare(`SELECT turn_id FROM turns
-        WHERE conversation_id = ? AND (client_message_id = ? OR (? IS NOT NULL AND retry_request_id = ?))`)
-      .get(conversationId, clientMessageId, retryRequestId ?? null, retryRequestId ?? null) as Row | undefined;
+      .prepare("SELECT turn_id FROM turns WHERE conversation_id = ? AND client_message_id = ?")
+      .get(conversationId, clientMessageId) as Row | undefined;
     return row ? stringValue(row, "turn_id") : null;
   }
 }
@@ -292,6 +507,7 @@ export class FactRepository {
 
   save(input: ConversationFactInput): CustomerFact {
     const { conversation_id: conversationId, fact } = ConversationFactInputSchema.parse(input);
+    assertSourceRefsBelongToConversation(this.database, conversationId, fact.source_refs);
     const existing = this.database
       .prepare("SELECT conversation_id FROM customer_facts WHERE fact_id = ?")
       .get(fact.fact_id) as Row | undefined;
@@ -533,6 +749,7 @@ export class QuoteVersionRepository {
     const { turn_id: turnId, quote } = SaveQuoteInputSchema.parse(input);
     assertRuleRefsAreComplete(quote);
     return inTransaction(this.database, () => {
+      assertRuleRefsMatchDatabase(this.database, quote);
       const existing = this.database
         .prepare("SELECT quote_id FROM quote_versions WHERE quote_id = ?")
         .get(quote.quote_id) as Row | undefined;
@@ -652,11 +869,248 @@ export class QuoteVersionRepository {
   }
 }
 
+export class PersistenceUnitOfWork {
+  constructor(
+    private readonly database: DatabaseSync,
+    private readonly hooks?: TransactionHooks,
+  ) {}
+
+  completeTurn(input: CompleteTurnInput): PersistedTurn {
+    const completion = CompleteTurnInputSchema.parse(input);
+    return inTransaction(this.database, () => {
+      const processing = requiredRow(
+        this.database.prepare(`SELECT * FROM turns
+          WHERE turn_id = ? AND conversation_id = ? AND status = ?`)
+          .get(completion.turn_id, completion.conversation_id, completion.expected_status) as Row | undefined,
+        "processing turn",
+      );
+      this.insertKnowledgeEvidence(completion.conversation_id, completion.turn_id, completion.knowledge_evidence);
+      this.hooks?.afterStep?.("turn_complete", "knowledge_evidence_saved");
+
+      const facts = new FactRepository(this.database);
+      for (const fact of completion.memory_plan.fact_upserts) {
+        facts.save({ conversation_id: completion.conversation_id, fact });
+      }
+      for (const factId of completion.memory_plan.fact_ids_to_mark_conflicted) {
+        const result = this.database.prepare(`UPDATE customer_facts SET status = 'conflicted'
+          WHERE fact_id = ? AND conversation_id = ?`)
+          .run(factId, completion.conversation_id);
+        if (result.changes !== 1) {
+          throw new Error(`fact ${factId} is not available in the current conversation`);
+        }
+      }
+      if (completion.memory_plan.summary_upsert) {
+        this.upsertSummary(completion.conversation_id, completion.memory_plan.summary_upsert);
+      }
+      this.hooks?.afterStep?.("turn_complete", "memory_saved");
+
+      if (completion.quote_outcome?.kind === "quote") {
+        new QuoteVersionRepository(this.database, this.hooks).save({
+          turn_id: completion.turn_id,
+          quote: completion.quote_outcome.quote,
+        });
+      }
+      this.hooks?.afterStep?.("turn_complete", "quote_saved");
+
+      assertAssistantEvidenceBelongsToTurn(
+        this.database,
+        completion.conversation_id,
+        completion.turn_id,
+        completion.assistant_message,
+      );
+      this.database.prepare(`INSERT INTO messages (
+        message_id, conversation_id, turn_id, role, content, sequence,
+        cited_evidence_ids_json, created_at
+      ) VALUES (?, ?, ?, 'assistant', ?, ?, ?, ?)`)
+        .run(
+          completion.assistant_message.message_id,
+          completion.conversation_id,
+          completion.turn_id,
+          completion.assistant_message.content,
+          completion.assistant_message.sequence,
+          JSON.stringify(completion.assistant_message.cited_evidence_ids),
+          completion.assistant_message.created_at,
+        );
+      this.hooks?.afterStep?.("turn_complete", "assistant_message_saved");
+
+      const outcome = deriveTurnOutcome(completion);
+      const updated = this.database.prepare(`UPDATE turns SET
+        status = 'COMPLETED', outcome = ?, completed_at = ?, failure_code = NULL,
+        failure_retryable = NULL, analysis_json = ?
+        WHERE turn_id = ? AND conversation_id = ? AND status = ?`)
+        .run(
+          outcome,
+          completion.assistant_message.created_at,
+          JSON.stringify(AnalysisResultSchema.parse(completion.analysis)),
+          completion.turn_id,
+          completion.conversation_id,
+          completion.expected_status,
+        );
+      if (updated.changes !== 1) throw new Error("turn completion lost its PROCESSING precondition");
+      const retryRequestId = nullableString(processing, "retry_request_id");
+      if (retryRequestId) {
+        this.database.prepare(`UPDATE turn_retry_attempts
+          SET status = 'COMPLETED', finished_at = ?
+          WHERE turn_id = ? AND retry_request_id = ? AND status = 'PROCESSING'`)
+          .run(completion.assistant_message.created_at, completion.turn_id, retryRequestId);
+      }
+      this.database.prepare(`UPDATE conversations SET stage = ?, updated_at = ?
+        WHERE conversation_id = ?`)
+        .run(completion.final_stage, completion.assistant_message.created_at, completion.conversation_id);
+      this.hooks?.afterStep?.("turn_complete", "turn_completed");
+      return new MessageRepository(this.database).getTurn(completion.conversation_id, completion.turn_id);
+    });
+  }
+
+  failTurn(input: FailTurnInput): PersistedTurn {
+    const failure = FailTurnInputSchema.parse(input);
+    return inTransaction(this.database, () => {
+      const row = requiredRow(
+        this.database.prepare(`SELECT retry_request_id FROM turns
+          WHERE turn_id = ? AND conversation_id = ? AND status = ?`)
+          .get(failure.turn_id, failure.conversation_id, failure.expected_status) as Row | undefined,
+        "processing turn",
+      );
+      const failedAt = new Date().toISOString();
+      const updated = this.database.prepare(`UPDATE turns SET
+        status = 'FAILED', outcome = NULL, completed_at = ?, failure_code = ?,
+        failure_retryable = ?
+        WHERE turn_id = ? AND conversation_id = ? AND status = ?`)
+        .run(
+          failedAt,
+          failure.error_code,
+          failure.retryable ? 1 : 0,
+          failure.turn_id,
+          failure.conversation_id,
+          failure.expected_status,
+        );
+      if (updated.changes !== 1) throw new Error("turn failure lost its PROCESSING precondition");
+      const retryRequestId = nullableString(row, "retry_request_id");
+      if (retryRequestId) {
+        this.database.prepare(`UPDATE turn_retry_attempts
+          SET status = 'FAILED', finished_at = ?
+          WHERE turn_id = ? AND retry_request_id = ? AND status = 'PROCESSING'`)
+          .run(failedAt, failure.turn_id, retryRequestId);
+      }
+      this.hooks?.afterStep?.("turn_fail", "turn_failed");
+      return new MessageRepository(this.database).getTurn(failure.conversation_id, failure.turn_id);
+    });
+  }
+
+  private insertKnowledgeEvidence(
+    conversationId: string,
+    turnId: string,
+    evidenceItems: KnowledgeEvidence[],
+  ): void {
+    const insert = this.database.prepare(`INSERT INTO knowledge_evidence (
+      evidence_id, conversation_id, turn_id, contract_version, knowledge_base_id,
+      document_id, document_version, chunk_id, title, excerpt, score, metadata_json,
+      candidate_rule_ids_json, provider_request_id, created_at
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?)`);
+    for (const raw of evidenceItems) {
+      const evidence = KnowledgeEvidenceSchema.parse(raw);
+      insert.run(
+        evidence.evidence_id,
+        conversationId,
+        turnId,
+        evidence.contract_version,
+        evidence.knowledge_base_id,
+        evidence.document_id,
+        evidence.document_version,
+        evidence.chunk_id,
+        evidence.title,
+        evidence.excerpt,
+        evidence.score,
+        JSON.stringify(evidence.metadata),
+        JSON.stringify(evidence.candidate_rule_ids),
+        new Date().toISOString(),
+      );
+    }
+  }
+
+  private upsertSummary(
+    conversationId: string,
+    summary: CompleteTurnInput["memory_plan"]["summary_upsert"] & {},
+  ): void {
+    for (const messageId of summary.source_message_ids) {
+      const found = this.database
+        .prepare("SELECT 1 FROM messages WHERE message_id = ? AND conversation_id = ?")
+        .get(messageId, conversationId);
+      if (!found) {
+        throw new Error(`summary source message ${messageId} is not available in the current conversation`);
+      }
+    }
+    const existing = this.database
+      .prepare("SELECT conversation_id FROM memory_summaries WHERE summary_id = ?")
+      .get(summary.summary_id) as Row | undefined;
+    if (existing && stringValue(existing, "conversation_id") !== conversationId) {
+      throw new Error("summary_id already belongs to another conversation");
+    }
+    this.database.prepare(`INSERT INTO memory_summaries (
+      summary_id, conversation_id, version, summary_text, covers_sequence_from,
+      covers_sequence_to, source_message_ids_json, created_at
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+    ON CONFLICT(summary_id) DO UPDATE SET
+      version = excluded.version,
+      summary_text = excluded.summary_text,
+      covers_sequence_from = excluded.covers_sequence_from,
+      covers_sequence_to = excluded.covers_sequence_to,
+      source_message_ids_json = excluded.source_message_ids_json,
+      created_at = excluded.created_at`)
+      .run(
+        summary.summary_id,
+        conversationId,
+        summary.version,
+        summary.text,
+        summary.covers_sequence_from,
+        summary.covers_sequence_to,
+        JSON.stringify(summary.source_message_ids),
+        summary.created_at,
+      );
+  }
+}
+
+function deriveTurnOutcome(input: CompleteTurnInput): "answer" | "question" | "quote" | "safe_stop" {
+  if (input.quote_outcome?.kind === "quote") return "quote";
+  if (
+    input.analysis.recommended_next_action === "safe_stop" ||
+    input.analysis.safety_flags.length > 0
+  ) return "safe_stop";
+  if (
+    input.analysis.recommended_next_action === "ask_missing_fields" ||
+    input.analysis.recommended_next_action === "clarify_conflict"
+  ) return "question";
+  return "answer";
+}
+
 function assertRuleRefsAreComplete(quote: QuoteResult): void {
-  const expected = new Set(quote.items.map((item) => `${item.rule_ref.rule_version_id}:${item.rule_ref.version}`));
-  const declared = new Set(quote.rule_versions.map((rule) => `${rule.rule_version_id}:${rule.version}`));
+  const expected = new Set(
+    quote.items.map(
+      (item) => `${item.rule_ref.rule_id}:${item.rule_ref.rule_version_id}:${item.rule_ref.version}`,
+    ),
+  );
+  const declared = new Set(
+    quote.rule_versions.map((rule) => `${rule.rule_id}:${rule.rule_version_id}:${rule.version}`),
+  );
   if (expected.size !== declared.size || [...expected].some((key) => !declared.has(key))) {
     throw new Error("quote rule_versions must exactly match the rule references used by items");
+  }
+}
+
+function assertRuleRefsMatchDatabase(database: DatabaseSync, quote: QuoteResult): void {
+  for (const rule of quote.rule_versions) {
+    const row = database
+      .prepare("SELECT rule_id, version FROM rule_versions WHERE rule_version_id = ?")
+      .get(rule.rule_version_id) as Row | undefined;
+    if (
+      !row ||
+      stringValue(row, "rule_id") !== rule.rule_id ||
+      numberValue(row, "version") !== rule.version
+    ) {
+      throw new Error(
+        `quote rule reference does not match stored rule version ${rule.rule_version_id}`,
+      );
+    }
   }
 }
 
@@ -668,5 +1122,6 @@ export function createSqliteRepositories(database: DatabaseSync, hooks?: Transac
     memory: new MemoryRepository(database),
     rules: new RuleVersionRepository(database, hooks),
     quotes: new QuoteVersionRepository(database, hooks),
+    unitOfWork: new PersistenceUnitOfWork(database, hooks),
   };
 }

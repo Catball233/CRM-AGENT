@@ -4,9 +4,14 @@ import { join, resolve } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import {
   createSqliteRepositories,
+  type CompleteTurnInput,
   type RuleVersionRecord,
   type SaveTurnInput,
 } from "../../packages/sqlite-repository/src/index";
+import {
+  validAnalysisResult,
+  validKnowledgeEvidence,
+} from "../../packages/test-fixtures/src/index";
 import {
   migrateDatabase,
   openDatabase,
@@ -40,6 +45,16 @@ const ids = {
   ruleVersion: "30000000-0000-4000-8000-000000000007",
   quote: "30000000-0000-4000-8000-000000000008",
   quoteItem: "30000000-0000-4000-8000-000000000009",
+} as const;
+
+const otherIds = {
+  conversation: "31000000-0000-4000-8000-000000000001",
+  turn: "31000000-0000-4000-8000-000000000002",
+  userMessage: "31000000-0000-4000-8000-000000000003",
+  assistantMessage: "31000000-0000-4000-8000-000000000004",
+  fact: "31000000-0000-4000-8000-000000000005",
+  retryOne: "31000000-0000-4000-8000-000000000006",
+  retryTwo: "31000000-0000-4000-8000-000000000007",
 } as const;
 
 function conversation(conversationId = ids.conversation) {
@@ -84,6 +99,25 @@ function completedTurn(overrides: Partial<SaveTurnInput> = {}): SaveTurnInput {
   };
 }
 
+function processingTurn(overrides: Partial<SaveTurnInput> = {}): SaveTurnInput {
+  return {
+    conversation_id: ids.conversation,
+    turn_id: ids.turn,
+    client_message_id: ids.userMessage,
+    status: "PROCESSING",
+    started_at: "2026-08-06T06:01:00Z",
+    warnings: [],
+    messages: [{
+      message_id: ids.userMessage,
+      role: "user",
+      content: "这是虚构的 Repository 测试消息。",
+      sequence: 1,
+      created_at: "2026-08-06T06:01:00Z",
+    }],
+    ...overrides,
+  };
+}
+
 function validatedRule(
   ruleVersionId = ids.ruleVersion,
   version = 1,
@@ -118,6 +152,95 @@ function insertEvidence(database: ReturnType<typeof openDatabase>) {
   ) VALUES (?, ?, ?, 'kb-fixture', 'doc-fixture', '0.2.0', 'chunk-c02',
     'C-02 虚构依据', '仅用于 Repository 自动化测试。', 0.9, ?)`)
     .run(ids.evidence, ids.conversation, ids.turn, "2026-08-06T06:01:01Z");
+}
+
+function quoteFixture(ruleId = "FIXTURE-C02-DESIGN-AREA") {
+  return {
+    contract_version: "1.0.0" as const,
+    quote_id: ids.quote,
+    conversation_id: ids.conversation,
+    quote_version: 1,
+    parent_quote_id: null,
+    status: "estimated" as const,
+    currency: "CNY" as const,
+    parameters_snapshot: {
+      city: "示例市",
+      area_sqm: 88,
+      house_state: "rough" as const,
+      service_scope: "whole_home" as const,
+      material_tier: "fixture_standard",
+      designer_tier: "fixture_standard",
+      quantities: {},
+      special_requirements: [],
+    },
+    items: [{
+      quote_item_id: ids.quoteItem,
+      category: "design" as const,
+      label: "虚构设计费",
+      calculation_type: "AREA_MULTIPLY" as const,
+      quantity: 88,
+      unit: "sqm",
+      unit_price_fen: 12_000,
+      amount_fen: 1_056_000,
+      calculation_inputs: { area_sqm: 88 },
+      rule_ref: { rule_id: ruleId, rule_version_id: ids.ruleVersion, version: 1 },
+    }],
+    estimated_total_fen: 1_056_000,
+    rule_versions: [{ rule_id: ruleId, rule_version_id: ids.ruleVersion, version: 1 }],
+    knowledge_evidence_ids: [ids.evidence],
+    assumptions: ["仅用于虚构测试"],
+    exclusions: [],
+    disclaimer: "本报价为虚构测试数据，不构成商业报价。",
+    created_at: "2026-08-06T06:04:00Z",
+  };
+}
+
+function completeTurnFixture(): CompleteTurnInput {
+  return {
+    conversation_id: ids.conversation,
+    turn_id: ids.turn,
+    expected_status: "PROCESSING",
+    final_stage: "QUOTING",
+    analysis: {
+      ...validAnalysisResult,
+      value_assessment: {
+        ...validAnalysisResult.value_assessment,
+        evidence_refs: [{ source_type: "message", source_id: ids.userMessage }],
+      },
+      slot_updates: [],
+    },
+    memory_plan: {
+      contract_version: "1.0.0",
+      conversation_id: ids.conversation,
+      turn_id: ids.turn,
+      fact_upserts: [{
+        fact_id: ids.fact,
+        fact_key: "area_sqm",
+        category: "requirement",
+        value: 88,
+        status: "confirmed",
+        confidence: 1,
+        source_refs: [{ source_type: "message", source_id: ids.userMessage }],
+        updated_at: "2026-08-06T06:03:00Z",
+      }],
+      fact_ids_to_mark_conflicted: [],
+      summary_upsert: null,
+    },
+    knowledge_evidence: [{
+      ...validKnowledgeEvidence,
+      evidence_id: ids.evidence,
+      candidate_rule_ids: ["FIXTURE-C02-DESIGN-AREA"],
+    }],
+    quote_outcome: { kind: "quote", quote: quoteFixture() },
+    assistant_message: {
+      message_id: ids.assistantMessage,
+      role: "assistant",
+      content: "这是统一事务生成的虚构报价回复。",
+      sequence: 2,
+      cited_evidence_ids: [ids.evidence],
+      created_at: "2026-08-06T06:04:00Z",
+    },
+  };
 }
 
 afterEach(() => {
@@ -294,6 +417,188 @@ describe("SQLite repositories and transactions", () => {
       expect(repositories.quotes.get(ids.conversation, ids.quote).disclaimer).toBe(quote.disclaimer);
       expect(repositories.quotes.listForConversation(ids.conversation)).toHaveLength(1);
       expect(repositories.quotes.nextVersion(ids.conversation)).toBe(2);
+    } finally {
+      database.close();
+    }
+  });
+
+  it("advances PROCESSING turns, rejects concurrent turns, and keeps retry attempts idempotent", () => {
+    const database = openMigratedDatabase();
+    try {
+      const repositories = createSqliteRepositories(database);
+      repositories.conversations.create(conversation());
+      expect(repositories.messages.saveTurn(processingTurn()).status).toBe("PROCESSING");
+      expect(() => repositories.messages.saveTurn(processingTurn({
+        turn_id: otherIds.turn,
+        client_message_id: otherIds.userMessage,
+        messages: [{
+          message_id: otherIds.userMessage,
+          role: "user",
+          content: "同一会话的并发虚构消息。",
+          sequence: 2,
+          created_at: "2026-08-06T06:01:01Z",
+        }],
+      }))).toThrow(/CONVERSATION_BUSY/);
+      expect(repositories.messages.saveTurn(completedTurn()).status).toBe("COMPLETED");
+      expect(repositories.messages.getTurn(ids.conversation, ids.turn).messages).toHaveLength(2);
+
+      repositories.conversations.create(conversation(otherIds.conversation));
+      const retryBase = processingTurn({
+        conversation_id: otherIds.conversation,
+        turn_id: otherIds.turn,
+        client_message_id: otherIds.userMessage,
+        messages: [{
+          message_id: otherIds.userMessage,
+          role: "user",
+          content: "用于失败重试的虚构消息。",
+          sequence: 1,
+          created_at: "2026-08-06T06:02:00Z",
+        }],
+        started_at: "2026-08-06T06:02:00Z",
+      });
+      repositories.messages.saveTurn(retryBase);
+      expect(repositories.unitOfWork.failTurn({
+        conversation_id: otherIds.conversation,
+        turn_id: otherIds.turn,
+        expected_status: "PROCESSING",
+        error_code: "FIXTURE_FAILURE",
+        retryable: true,
+      }).status).toBe("FAILED");
+      const firstRetry = repositories.messages.saveTurn({
+        ...retryBase,
+        retry_request_id: otherIds.retryOne,
+      });
+      expect(firstRetry).toMatchObject({ status: "PROCESSING", attempt_count: 2 });
+      expect(repositories.messages.saveTurn({
+        ...retryBase,
+        retry_request_id: otherIds.retryOne,
+      }).attempt_count).toBe(2);
+      repositories.unitOfWork.failTurn({
+        conversation_id: otherIds.conversation,
+        turn_id: otherIds.turn,
+        expected_status: "PROCESSING",
+        error_code: "FIXTURE_FAILURE_AGAIN",
+        retryable: true,
+      });
+      expect(repositories.messages.saveTurn({
+        ...retryBase,
+        retry_request_id: otherIds.retryTwo,
+      }).attempt_count).toBe(3);
+      expect(database.prepare("SELECT COUNT(*) AS count FROM turn_retry_attempts").get()).toEqual({ count: 2 });
+    } finally {
+      database.close();
+    }
+  });
+
+  it("rejects cross-conversation fact sources and assistant evidence without partial writes", () => {
+    const database = openMigratedDatabase();
+    try {
+      const repositories = createSqliteRepositories(database);
+      repositories.conversations.create(conversation());
+      repositories.messages.saveTurn(completedTurn());
+      insertEvidence(database);
+      repositories.conversations.create(conversation(otherIds.conversation));
+
+      expect(() => repositories.facts.save({
+        conversation_id: otherIds.conversation,
+        fact: {
+          fact_id: otherIds.fact,
+          fact_key: "area_sqm",
+          category: "requirement",
+          value: 66,
+          status: "confirmed",
+          source_refs: [{ source_type: "message", source_id: ids.userMessage }],
+          updated_at: "2026-08-06T06:05:00Z",
+        },
+      })).toThrow(/CROSS_CONVERSATION_REFERENCE/);
+
+      expect(() => repositories.messages.saveTurn(completedTurn({
+        conversation_id: otherIds.conversation,
+        turn_id: otherIds.turn,
+        client_message_id: otherIds.userMessage,
+        messages: [
+          {
+            message_id: otherIds.userMessage,
+            role: "user",
+            content: "另一个会话的虚构消息。",
+            sequence: 1,
+            created_at: "2026-08-06T06:05:00Z",
+          },
+          {
+            message_id: otherIds.assistantMessage,
+            role: "assistant",
+            content: "不应引用其他会话证据。",
+            sequence: 2,
+            cited_evidence_ids: [ids.evidence],
+            created_at: "2026-08-06T06:05:01Z",
+          },
+        ],
+        started_at: "2026-08-06T06:05:00Z",
+        completed_at: "2026-08-06T06:05:01Z",
+      }))).toThrow(/CROSS_CONVERSATION_REFERENCE/);
+      expect(database.prepare("SELECT COUNT(*) AS count FROM turns WHERE conversation_id = ?")
+        .get(otherIds.conversation)).toEqual({ count: 0 });
+      expect(database.prepare("SELECT COUNT(*) AS count FROM customer_facts WHERE conversation_id = ?")
+        .get(otherIds.conversation)).toEqual({ count: 0 });
+    } finally {
+      database.close();
+    }
+  });
+
+  it("rejects a quote whose rule_id disagrees with the stored rule version", () => {
+    const database = openMigratedDatabase();
+    try {
+      const repositories = createSqliteRepositories(database);
+      repositories.conversations.create(conversation());
+      repositories.messages.saveTurn(completedTurn({ outcome: "quote" }));
+      repositories.rules.create(validatedRule());
+      repositories.rules.activate({ rule_version_id: ids.ruleVersion, activated_at: "2026-08-06T06:02:00Z" });
+      insertEvidence(database);
+      expect(() => repositories.quotes.save({
+        turn_id: ids.turn,
+        quote: quoteFixture("FIXTURE-C02-WRONG-RULE"),
+      })).toThrow(/does not match stored rule version/);
+      expect(database.prepare("SELECT COUNT(*) AS count FROM quote_versions").get()).toEqual({ count: 0 });
+    } finally {
+      database.close();
+    }
+  });
+
+  it("completes facts, evidence, quote, assistant message, stage, and turn in one transaction", () => {
+    const database = openMigratedDatabase();
+    try {
+      const setup = createSqliteRepositories(database);
+      setup.conversations.create(conversation());
+      setup.messages.saveTurn(processingTurn());
+      setup.rules.create(validatedRule());
+      setup.rules.activate({ rule_version_id: ids.ruleVersion, activated_at: "2026-08-06T06:02:00Z" });
+
+      const failing = createSqliteRepositories(database, {
+        afterStep(boundary, step) {
+          if (boundary === "turn_complete" && step === "assistant_message_saved") {
+            throw new Error("injected complete-turn failure");
+          }
+        },
+      });
+      expect(() => failing.unitOfWork.completeTurn(completeTurnFixture())).toThrow(
+        /injected complete-turn failure/,
+      );
+      expect(setup.messages.getTurn(ids.conversation, ids.turn)).toMatchObject({
+        status: "PROCESSING",
+        messages: [{ role: "user" }],
+      });
+      expect(database.prepare("SELECT COUNT(*) AS count FROM customer_facts").get()).toEqual({ count: 0 });
+      expect(database.prepare("SELECT COUNT(*) AS count FROM knowledge_evidence").get()).toEqual({ count: 0 });
+      expect(database.prepare("SELECT COUNT(*) AS count FROM quote_versions").get()).toEqual({ count: 0 });
+
+      const completed = setup.unitOfWork.completeTurn(completeTurnFixture());
+      expect(completed).toMatchObject({ status: "COMPLETED", outcome: "quote" });
+      expect(completed.messages).toHaveLength(2);
+      expect(setup.conversations.get(ids.conversation).stage).toBe("QUOTING");
+      expect(setup.facts.listForConversation(ids.conversation)).toHaveLength(1);
+      expect(setup.quotes.listForConversation(ids.conversation)).toHaveLength(1);
+      expect(database.prepare("SELECT analysis_json IS NOT NULL AS saved FROM turns WHERE turn_id = ?")
+        .get(ids.turn)).toEqual({ saved: 1 });
     } finally {
       database.close();
     }

@@ -1,10 +1,16 @@
 import { z } from "zod";
 import {
+  AnalysisResultSchema,
+  AssistantMessageViewSchema,
+  ConversationStageSchema,
   CustomerFactSchema,
   IdSchema,
   IsoDateTimeSchema,
+  KnowledgeEvidenceSchema,
+  MemoryMutationPlanSchema,
   MemorySummaryViewSchema,
   MessageViewSchema,
+  QuoteOutcomeSchema,
   QuoteResultSchema,
   RuleDefinitionSchema,
   RuleVersionRefSchema,
@@ -17,7 +23,9 @@ export const PersistedTurnSchema = z
     turn_id: IdSchema,
     conversation_id: IdSchema,
     client_message_id: IdSchema,
+    content_hash: z.string().regex(/^[a-f0-9]{64}$/),
     retry_request_id: IdSchema.nullable(),
+    attempt_count: z.number().int().positive(),
     status: TurnStatusSchema,
     outcome: TurnOutcomeSchema.nullable(),
     started_at: IsoDateTimeSchema,
@@ -34,6 +42,7 @@ export const SaveTurnInputSchema = z
     conversation_id: IdSchema,
     turn_id: IdSchema,
     client_message_id: IdSchema,
+    content_hash: z.string().regex(/^[a-f0-9]{64}$/).optional(),
     retry_request_id: IdSchema.optional(),
     status: TurnStatusSchema,
     outcome: TurnOutcomeSchema.optional(),
@@ -64,6 +73,68 @@ export const SaveTurnInputSchema = z
     }
   });
 export type SaveTurnInput = z.input<typeof SaveTurnInputSchema>;
+
+export const BeginTurnInputSchema = z
+  .object({
+    conversation_id: IdSchema,
+    client_message_id: IdSchema,
+    content: z.string().min(1).max(8_000),
+    content_hash: z.string().regex(/^[a-f0-9]{64}$/),
+  })
+  .strict();
+export type BeginTurnInput = z.infer<typeof BeginTurnInputSchema>;
+
+export const CompleteTurnInputSchema = z
+  .object({
+    conversation_id: IdSchema,
+    turn_id: IdSchema,
+    expected_status: z.literal("PROCESSING"),
+    final_stage: ConversationStageSchema,
+    analysis: AnalysisResultSchema,
+    memory_plan: MemoryMutationPlanSchema,
+    knowledge_evidence: z.array(KnowledgeEvidenceSchema).max(20),
+    quote_outcome: QuoteOutcomeSchema.nullable(),
+    assistant_message: AssistantMessageViewSchema,
+  })
+  .strict()
+  .superRefine((value, context) => {
+    if (value.memory_plan.conversation_id !== value.conversation_id) {
+      context.addIssue({
+        code: "custom",
+        path: ["memory_plan", "conversation_id"],
+        message: "memory plan conversation must match completion input",
+      });
+    }
+    if (value.memory_plan.turn_id !== value.turn_id) {
+      context.addIssue({
+        code: "custom",
+        path: ["memory_plan", "turn_id"],
+        message: "memory plan turn must match completion input",
+      });
+    }
+    if (
+      value.quote_outcome?.kind === "quote" &&
+      value.quote_outcome.quote.conversation_id !== value.conversation_id
+    ) {
+      context.addIssue({
+        code: "custom",
+        path: ["quote_outcome", "quote", "conversation_id"],
+        message: "quote conversation must match completion input",
+      });
+    }
+  });
+export type CompleteTurnInput = z.infer<typeof CompleteTurnInputSchema>;
+
+export const FailTurnInputSchema = z
+  .object({
+    conversation_id: IdSchema,
+    turn_id: IdSchema,
+    expected_status: z.literal("PROCESSING"),
+    error_code: z.string().min(1).max(200),
+    retryable: z.boolean(),
+  })
+  .strict();
+export type FailTurnInput = z.infer<typeof FailTurnInputSchema>;
 
 export const ConversationFactInputSchema = z
   .object({
@@ -137,7 +208,12 @@ export const SaveQuoteInputSchema = z
   .strict();
 export type SaveQuoteInput = z.infer<typeof SaveQuoteInputSchema>;
 
-export type TransactionBoundary = "message_save" | "rule_activation" | "quote_save";
+export type TransactionBoundary =
+  | "message_save"
+  | "rule_activation"
+  | "quote_save"
+  | "turn_complete"
+  | "turn_fail";
 
 export interface TransactionHooks {
   afterStep?(boundary: TransactionBoundary, step: string): void;

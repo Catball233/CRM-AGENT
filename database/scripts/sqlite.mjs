@@ -131,6 +131,7 @@ export function verifyDatabase(database) {
     "schema_migrations",
     "conversations",
     "turns",
+    "turn_retry_attempts",
     "messages",
     "memory_summaries",
     "customer_facts",
