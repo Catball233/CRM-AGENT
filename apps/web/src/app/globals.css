@@ -253,3 +253,58 @@ button:disabled { opacity: 0.42; cursor: not-allowed; }
 @media (prefers-reduced-motion: reduce) {
   *, *::before, *::after { scroll-behavior: auto !important; animation-duration: 0.01ms !important; animation-iteration-count: 1 !important; transition-duration: 0.01ms !important; }
 }
+
+/* D-03 报价卡片与状态 */
+.quote-card {
+  margin: 14px clamp(20px, 5vw, 70px) 4px;
+  padding: 18px;
+  border: 1px solid var(--line-bright);
+  border-radius: 14px;
+  background: linear-gradient(135deg, rgba(38, 99, 129, 0.14), rgba(16, 24, 43, 0.82));
+  box-shadow: 0 18px 40px -28px rgba(81, 216, 255, 0.4);
+}
+.quote-card.quote-loading {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  color: var(--muted);
+  font-size: 13px;
+  border-color: var(--line);
+  background: rgba(16, 24, 43, 0.72);
+  box-shadow: none;
+}
+.quote-header { display: flex; align-items: flex-start; justify-content: space-between; gap: 12px; margin-bottom: 14px; }
+.quote-header h3 { margin: 4px 0 0; font-size: 15px; color: var(--text); }
+.quote-version-chip { flex-shrink: 0; padding: 4px 10px; border: 1px solid var(--line-bright); border-radius: 999px; color: var(--cyan); font-size: 11px; font-weight: 600; }
+.quote-total { display: flex; align-items: baseline; gap: 10px; padding: 14px 16px; margin-bottom: 14px; border: 1px solid var(--line); border-radius: 10px; background: rgba(13, 19, 35, 0.7); }
+.quote-total span { color: var(--muted); font-size: 12px; }
+.quote-total strong { font-size: 24px; color: var(--cyan); letter-spacing: 0.5px; }
+.quote-total small { color: var(--muted); font-size: 11px; }
+.quote-params { display: grid; grid-template-columns: repeat(auto-fit, minmax(120px, 1fr)); gap: 8px 16px; margin: 0 0 14px; }
+.quote-params div { display: flex; flex-direction: column; gap: 3px; }
+.quote-params dt { color: var(--muted); font-size: 10px; }
+.quote-params dd { margin: 0; color: var(--text); font-size: 13px; }
+.quote-items { padding: 12px 14px; margin-bottom: 12px; border: 1px solid var(--line); border-radius: 10px; background: rgba(16, 24, 43, 0.6); }
+.quote-items .panel-heading, .quote-notes .panel-heading { display: flex; justify-content: space-between; margin: 0 0 8px; color: var(--muted); font-size: 11px; }
+.quote-items ul, .quote-notes ul { margin: 0; padding: 0; list-style: none; }
+.quote-items li { display: flex; align-items: center; justify-content: space-between; gap: 12px; padding: 8px 0; border-bottom: 1px solid var(--line); font-size: 13px; }
+.quote-items li:last-child { border-bottom: none; }
+.quote-item-label { display: flex; align-items: center; gap: 8px; min-width: 0; }
+.quote-item-cat { flex-shrink: 0; padding: 2px 7px; border: 1px solid var(--line); border-radius: 5px; color: var(--muted); font-size: 10px; }
+.quote-item-amount { display: flex; flex-direction: column; align-items: flex-end; gap: 2px; }
+.quote-item-amount small { color: var(--muted); font-size: 10px; }
+.quote-item-amount strong { color: var(--text); font-size: 13px; }
+.quote-notes { margin-bottom: 12px; }
+.quote-notes li { padding: 4px 0; color: #cbd6e8; font-size: 12px; line-height: 1.6; }
+.quote-disclaimer { margin: 0 0 12px; padding: 10px 12px; border-left: 2px solid var(--violet); background: rgba(162, 120, 255, 0.06); color: var(--muted); font-size: 11px; line-height: 1.6; }
+.quote-footer { display: flex; justify-content: space-between; color: var(--muted); font-size: 10px; }
+.quote-status-card { display: flex; align-items: center; gap: 12px; margin: 14px clamp(20px, 5vw, 70px) 4px; padding: 14px 16px; border: 1px solid var(--line); border-radius: 12px; background: rgba(16, 24, 43, 0.72); }
+.quote-status-card.kind-unavailable { border-color: rgba(255, 113, 133, 0.25); }
+.quote-status-card.kind-knowledge_insufficient { border-color: rgba(162, 120, 255, 0.28); }
+.quote-status-icon { width: 30px; height: 30px; display: grid; place-items: center; border: 1px solid currentColor; border-radius: 50%; font-size: 14px; color: var(--muted); }
+.quote-status-card.kind-unavailable .quote-status-icon { color: var(--danger); }
+.quote-status-card.kind-knowledge_insufficient .quote-status-icon { color: var(--violet); }
+.quote-status-card strong { display: block; color: var(--text); font-size: 13px; }
+.quote-status-card p { margin: 3px 0 0; color: var(--muted); font-size: 12px; line-height: 1.6; }
+.retry-button { margin-left: auto; padding: 4px 12px; border: 1px solid var(--line-bright); border-radius: 7px; background: transparent; color: var(--cyan); font-size: 12px; cursor: pointer; }
+.retry-button:disabled { opacity: 0.5; cursor: not-allowed; }

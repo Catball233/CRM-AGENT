@@ -24,6 +24,8 @@ import {
   upsertRecentConversation,
   type SessionIndex,
 } from "../chat/session-index";
+import { QuoteCard, QuoteLoadingCard, QuoteStatusCard } from "./quote-card";
+import type { ChatTurnResult } from "@crm-agent/contracts";
 
 const SUGGESTED_PROMPTS = [
   "我家 90㎡旧房，想做全屋中档装修",
@@ -112,6 +114,8 @@ export function ChatWorkspace({ gateway: providedGateway }: ChatWorkspaceProps) 
     "booting",
   );
   const [error, setError] = useState<string | null>(null);
+  const [lastResult, setLastResult] = useState<ChatTurnResult | null>(null);
+  const [retryContent, setRetryContent] = useState<string | null>(null);
   const [analysisOpen, setAnalysisOpen] = useState(true);
   const [sessionPanelOpen, setSessionPanelOpen] = useState(false);
   const [clearDialogOpen, setClearDialogOpen] = useState(false);
@@ -142,6 +146,8 @@ export function ChatWorkspace({ gateway: providedGateway }: ChatWorkspaceProps) 
       setStatus("loading");
       setError(null);
       setAnalysis(null);
+      setLastResult(null);
+      setRetryContent(null);
       try {
         const nextSnapshot = await targetGateway.getConversation(conversationId);
         if (requestId !== restoreRequestRef.current) return;
@@ -189,6 +195,8 @@ export function ChatWorkspace({ gateway: providedGateway }: ChatWorkspaceProps) 
     setStatus("loading");
     setError(null);
     setAnalysis(null);
+    setLastResult(null);
+    setRetryContent(null);
     try {
       const conversation = await gateway.createConversation();
       const nextSnapshot = await gateway.getConversation(conversation.conversation_id);
@@ -208,77 +216,92 @@ export function ChatWorkspace({ gateway: providedGateway }: ChatWorkspaceProps) 
     }
   }, [gateway, persistIndex, status, storage]);
 
-  const sendMessage = useCallback(async () => {
-    const content = draft.trim();
-    if (
-      !gateway ||
-      !snapshot ||
-      !storage ||
-      !content ||
-      status !== "ready" ||
-      clearDialogOpenRef.current ||
-      sendInFlightRef.current
-    ) {
-      return;
-    }
-    if (containsSensitiveInput(content)) {
-      setError(SENSITIVE_INPUT_MESSAGE);
-      return;
-    }
-
-    sendInFlightRef.current = true;
-    setStatus("sending");
-    setError(null);
-    setDraft("");
-    setPendingContent(content);
-    setStreamedText("");
-    const clientMessageId = createClientId();
-    let streamState = createChatStreamState(
-      snapshot.conversation.conversation_id,
-      clientMessageId,
-    );
-
-    try {
-      for await (const event of gateway.sendMessage(snapshot.conversation.conversation_id, {
-        contract_version: "1.0.0",
-        client_message_id: clientMessageId,
-        content,
-        response_mode: "stream",
-      })) {
-        streamState = reduceChatEvent(streamState, event);
-        setStreamedText(streamState.streamedText);
-        if (streamState.analysis) setAnalysis(streamState.analysis);
+  const runSend = useCallback(
+    async (content: string) => {
+      if (
+        !gateway ||
+        !snapshot ||
+        !storage ||
+        !content ||
+        status !== "ready" ||
+        clearDialogOpenRef.current ||
+        sendInFlightRef.current
+      ) {
+        return;
       }
-      assertTerminalStream(streamState);
-      if (streamState.terminal === "failed") {
-        throw new ChatGatewayError(
-          "unknown",
-          streamState.error?.message ?? "本轮处理失败，请稍后重试。",
-        );
+      if (containsSensitiveInput(content)) {
+        setError(SENSITIVE_INPUT_MESSAGE);
+        return;
       }
 
-      const nextSnapshot = await gateway.getConversation(snapshot.conversation.conversation_id);
-      setSnapshot(nextSnapshot);
-      const currentIndex = loadSessionIndex(storage);
-      const existing = currentIndex.conversations.find(
-        (item) => item.conversationId === snapshot.conversation.conversation_id,
-      );
-      persistIndex(
-        upsertRecentConversation(currentIndex, {
-          conversationId: snapshot.conversation.conversation_id,
-          title: existing?.title === "新建测试会话" || !existing ? createTitle(content) : existing.title,
-          updatedAt: nextSnapshot.conversation.updated_at,
-        }),
-      );
-    } catch (sendError) {
-      setError(getSafeErrorMessage(sendError));
-    } finally {
-      sendInFlightRef.current = false;
-      setPendingContent(null);
+      sendInFlightRef.current = true;
+      setStatus("sending");
+      setError(null);
+      setLastResult(null);
+      setRetryContent(null);
+      setDraft("");
+      setPendingContent(content);
       setStreamedText("");
-      setStatus("ready");
-    }
-  }, [draft, gateway, persistIndex, snapshot, status, storage]);
+      const clientMessageId = createClientId();
+      let streamState = createChatStreamState(
+        snapshot.conversation.conversation_id,
+        clientMessageId,
+      );
+
+      try {
+        for await (const event of gateway.sendMessage(snapshot.conversation.conversation_id, {
+          contract_version: "1.0.0",
+          client_message_id: clientMessageId,
+          content,
+          response_mode: "stream",
+        })) {
+          streamState = reduceChatEvent(streamState, event);
+          setStreamedText(streamState.streamedText);
+          if (streamState.analysis) setAnalysis(streamState.analysis);
+        }
+        assertTerminalStream(streamState);
+        if (streamState.terminal === "failed") {
+          throw new ChatGatewayError(
+            "unknown",
+            streamState.error?.message ?? "本轮处理失败，请稍后重试。",
+          );
+        }
+
+        setLastResult(streamState.result);
+        const nextSnapshot = await gateway.getConversation(snapshot.conversation.conversation_id);
+        setSnapshot(nextSnapshot);
+        const currentIndex = loadSessionIndex(storage);
+        const existing = currentIndex.conversations.find(
+          (item) => item.conversationId === snapshot.conversation.conversation_id,
+        );
+        persistIndex(
+          upsertRecentConversation(currentIndex, {
+            conversationId: snapshot.conversation.conversation_id,
+            title: existing?.title === "新建测试会话" || !existing ? createTitle(content) : existing.title,
+            updatedAt: nextSnapshot.conversation.updated_at,
+          }),
+        );
+        setRetryContent(null);
+      } catch (sendError) {
+        setError(getSafeErrorMessage(sendError));
+        setRetryContent(content);
+      } finally {
+        sendInFlightRef.current = false;
+        setPendingContent(null);
+        setStreamedText("");
+        setStatus("ready");
+      }
+    },
+    [gateway, persistIndex, snapshot, status, storage],
+  );
+
+  const sendMessage = useCallback(() => {
+    void runSend(draft.trim());
+  }, [draft, runSend]);
+
+  const retryLastTurn = useCallback(() => {
+    if (retryContent) void runSend(retryContent);
+  }, [retryContent, runSend]);
 
   const handleSubmit = (event: FormEvent) => {
     event.preventDefault();
@@ -348,6 +371,17 @@ export function ChatWorkspace({ gateway: providedGateway }: ChatWorkspaceProps) 
   const currentStage = snapshot ? STAGE_LABELS[snapshot.conversation.stage] : "等待会话";
 
   const visibleMessages = useMemo(() => snapshot?.messages ?? [], [snapshot]);
+
+  const activeQuote = lastResult?.quote ?? snapshot?.current_quote ?? null;
+  const quoteUnavailable =
+    lastResult !== null &&
+    lastResult.quote === null &&
+    lastResult.warnings.includes("no_active_rule");
+  const knowledgeInsufficient =
+    lastResult !== null && lastResult.warnings.includes("knowledge_insufficient");
+  const quoteLoading =
+    status === "sending" &&
+    (analysis?.next_action === "prepare_quote" || analysis?.next_action === "adjust_quote");
 
   return (
     <main className={`workspace ${analysisOpen ? "" : "analysis-collapsed"}`}>
@@ -502,10 +536,31 @@ export function ChatWorkspace({ gateway: providedGateway }: ChatWorkspaceProps) 
               </article>
             </>
           ) : null}
+
+          {activeQuote ? (
+            <QuoteCard quote={activeQuote} />
+          ) : quoteUnavailable ? (
+            <QuoteStatusCard kind="unavailable" />
+          ) : knowledgeInsufficient ? (
+            <QuoteStatusCard kind="knowledge_insufficient" />
+          ) : quoteLoading ? (
+            <QuoteLoadingCard />
+          ) : null}
+
           <div ref={messageEndRef} />
         </div>
 
-        {error ? <div className="error-banner" role="alert"><span aria-hidden="true">!</span>{error}</div> : null}
+        {error ? (
+          <div className="error-banner" role="alert">
+            <span aria-hidden="true">!</span>
+            {error}
+            {retryContent ? (
+              <button type="button" className="retry-button" onClick={retryLastTurn} disabled={isBusy}>
+                重试
+              </button>
+            ) : null}
+          </div>
+        ) : null}
 
         <form className="composer" onSubmit={handleSubmit}>
           <textarea
