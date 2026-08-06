@@ -148,6 +148,9 @@ export function verifyDatabase(database) {
     "quote_versions",
     "quote_items",
     "quote_knowledge_evidence",
+    "quote_internal_calculations",
+    "quote_internal_cost_items",
+    "quote_promotion_links",
     "seed_history",
   ];
   const rows = database
@@ -191,7 +194,24 @@ export function verifyBusinessInvariants(database) {
     throw new Error(`Quote total does not match item total for: ${quoteIds}`);
   }
 
-  return { quoteTotalViolations: 0, businessInvariants: "ok" };
+  const internalCalculationViolations = database.prepare(`
+    SELECT quote_internal_calculations.quote_id
+    FROM quote_internal_calculations
+    JOIN quote_versions USING (quote_id)
+    WHERE quote_internal_calculations.total_cost_fen <>
+      quote_internal_calculations.direct_cost_fen
+      + quote_internal_calculations.procurement_cost_fen
+      + quote_internal_calculations.gift_cost_fen
+      + quote_internal_calculations.free_service_cost_fen
+      OR quote_internal_calculations.final_revenue_fen <> quote_versions.estimated_total_fen
+      OR quote_internal_calculations.final_revenue_fen < quote_internal_calculations.floor_revenue_fen
+  `).all();
+  if (internalCalculationViolations.length > 0) {
+    const quoteIds = internalCalculationViolations.map((row) => row.quote_id).join(", ");
+    throw new Error(`Internal quote calculation is inconsistent for: ${quoteIds}`);
+  }
+
+  return { quoteTotalViolations: 0, internalCalculationViolations: 0, businessInvariants: "ok" };
 }
 
 export function resolveDatabasePath(input, projectRoot) {
