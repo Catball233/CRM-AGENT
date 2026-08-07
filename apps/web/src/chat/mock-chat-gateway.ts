@@ -76,6 +76,19 @@ function chooseScenario(content: string): Scenario {
     };
   }
 
+  if (/不可报价|无可用规则/.test(content)) {
+    return {
+      intent: "quote_request",
+      valueLevel: "medium",
+      nextAction: "prepare_quote",
+      outcome: "answer",
+      stage: "NEGOTIATION",
+      response: "当前没有可用的已激活报价规则，因此不会生成猜测价格。",
+      questionFields: [],
+      warnings: ["no_active_rule"],
+    };
+  }
+
   if (/生成测试报价|出测试报价/.test(content)) {
     return {
       intent: "quote_request",
@@ -148,7 +161,6 @@ function splitResponse(response: string) {
 export class MockChatGateway implements ChatGateway {
   private readonly delayMs: number;
   private readonly conversationGenerations = new Map<string, number>();
-  private readonly lastQuotes = new Map<string, { quoteId: string; version: number }>();
 
   constructor(
     private readonly storage: Storage,
@@ -191,7 +203,6 @@ export class MockChatGateway implements ChatGateway {
 
   async deleteConversation(conversationId: string): Promise<void> {
     this.advanceGeneration(conversationId);
-    this.lastQuotes.delete(conversationId);
     const store = this.readStore();
     delete store.conversations[conversationId];
     this.writeStore(store);
@@ -223,13 +234,7 @@ export class MockChatGateway implements ChatGateway {
       created_at: now,
       cited_evidence_ids: [],
     };
-    const quote = scenario.outcome === "quote" ? this.buildQuote(conversationId, now) : null;
-    if (quote) {
-      this.lastQuotes.set(conversationId, {
-        quoteId: quote.quote_id,
-        version: quote.quote_version,
-      });
-    }
+    const quote = scenario.outcome === "quote" ? this.buildQuote(conversationId, now, snapshot.current_quote) : null;
     const result: ChatTurnResult = ChatTurnResultSchema.parse({
       contract_version: "1.0.0",
       turn_id: turnId,
@@ -327,8 +332,8 @@ export class MockChatGateway implements ChatGateway {
     }
   }
 
-  private buildQuote(conversationId: string, now: string): QuoteResult {
-    const previous = this.lastQuotes.get(conversationId);
+  private buildQuote(conversationId: string, now: string, currentQuote: QuoteResult | null): QuoteResult {
+    const previous = currentQuote;
     const unitPriceFen = previous ? 118_000 : 128_000;
     const areaSqm = 90;
     const amountFen = unitPriceFen * areaSqm;
@@ -337,8 +342,8 @@ export class MockChatGateway implements ChatGateway {
       contract_version: "1.0.0",
       quote_id: createId(),
       conversation_id: conversationId,
-      quote_version: previous ? previous.version + 1 : 1,
-      parent_quote_id: previous ? previous.quoteId : null,
+      quote_version: previous ? previous.quote_version + 1 : 1,
+      parent_quote_id: previous ? previous.quote_id : null,
       status: "estimated",
       currency: "CNY",
       parameters_snapshot: {

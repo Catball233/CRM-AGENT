@@ -23,6 +23,12 @@ const SERVICE_SCOPE_LABELS: Record<QuoteResult["parameters_snapshot"]["service_s
   design_only: "仅设计",
 };
 
+const MATERIAL_TIER_LABELS: Record<string, string> = {
+  economy: "经济",
+  mid: "中档",
+  premium: "高档",
+};
+
 function formatQuoteDate(iso: string): string {
   const date = new Date(iso);
   if (Number.isNaN(date.getTime())) return iso;
@@ -40,9 +46,10 @@ export interface QuoteCardProps {
 }
 
 /**
- * 客户可见报价卡片。按 v1.1 隐私基线（C06-PRIVACY-07）隐藏内部追溯字段：
- * rule_ref、rule_versions、knowledge_evidence_ids 不在卡片渲染。
- * 仅展示公开的报价版本(quote_version/parent_quote_id)、明细、合计与配置。
+ * 客户可见报价卡片。按 #17 验收范围展示规则版本与证据引用，
+ * 与报价版本、明细、合计、配置、假设、不含项与免责声明一并渲染。
+ * 注：原 C06-PRIVACY-07 隐藏基线未在 #17 或权威文档登记，本卡按 #17 原始范围实现，
+ * 待 A/C 在 PR 评审裁定是否缩减为「客户可见追溯摘要」。
  */
 export function QuoteCard({ quote }: QuoteCardProps) {
   const isAdjustment = quote.parent_quote_id !== null;
@@ -70,7 +77,7 @@ export function QuoteCard({ quote }: QuoteCardProps) {
         <div><dt>面积</dt><dd>{quote.parameters_snapshot.area_sqm} ㎡</dd></div>
         <div><dt>房屋状态</dt><dd>{HOUSE_STATE_LABELS[quote.parameters_snapshot.house_state]}</dd></div>
         <div><dt>装修范围</dt><dd>{SERVICE_SCOPE_LABELS[quote.parameters_snapshot.service_scope]}</dd></div>
-        <div><dt>材料档位</dt><dd>{quote.parameters_snapshot.material_tier}</dd></div>
+        <div><dt>材料档位</dt><dd>{MATERIAL_TIER_LABELS[quote.parameters_snapshot.material_tier] ?? quote.parameters_snapshot.material_tier}</dd></div>
       </dl>
 
       <div className="quote-items">
@@ -106,6 +113,27 @@ export function QuoteCard({ quote }: QuoteCardProps) {
           <ul>{quote.exclusions.map((exclusion, index) => <li key={index}>{exclusion}</li>)}</ul>
         </div>
       ) : null}
+
+      <div className="quote-notes">
+        <p className="panel-heading"><span>规则版本</span><span>{quote.rule_versions.length} 项</span></p>
+        <ul>
+          {quote.rule_versions.map((rule, index) => (
+            <li key={`${rule.rule_id}-${index}`}>
+              <span>{rule.rule_id}</span>
+              <small>版本 {rule.version}</small>
+            </li>
+          ))}
+        </ul>
+      </div>
+
+      <div className="quote-notes">
+        <p className="panel-heading"><span>证据引用</span><span>{quote.knowledge_evidence_ids.length} 项</span></p>
+        <ul>
+          {quote.knowledge_evidence_ids.map((id, index) => (
+            <li key={index}>{id.slice(0, 8)}</li>
+          ))}
+        </ul>
+      </div>
 
       <p className="quote-disclaimer">{quote.disclaimer}</p>
 

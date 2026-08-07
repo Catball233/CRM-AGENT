@@ -337,3 +337,40 @@ describe("D-02 chat workspace", () => {
     expect(screen.getByRole("button", { name: "收起分析栏" })).toBeInTheDocument();
   });
 });
+
+describe("D-03 review regression fixes", () => {
+  it("does not let a prior quote occlude the knowledge_insufficient status", async () => {
+    const user = userEvent.setup();
+    render(<ChatWorkspace gateway={createGateway()} />);
+    await createSession(user);
+    const input = screen.getByLabelText("输入装修需求");
+    await user.type(input, "生成测试报价");
+    await user.click(screen.getByRole("button", { name: "发送消息" }));
+    expect(await screen.findAllByText("¥115,200.00")).toHaveLength(2);
+    await user.type(input, "环保材料");
+    await user.click(screen.getByRole("button", { name: "发送消息" }));
+    expect(await screen.findByText("知识不足")).toBeInTheDocument();
+    expect(screen.queryAllByText("¥115,200.00")).toHaveLength(0);
+  });
+  it("preserves newly typed draft when retrying a failed turn", async () => {
+    class FailSendGateway implements ChatGateway {
+      private readonly delegate = createGateway();
+      createConversation() { return this.delegate.createConversation(); }
+      getConversation(id: string): Promise<ConversationSnapshot> { return this.delegate.getConversation(id); }
+      deleteConversation(id: string): Promise<void> { return this.delegate.deleteConversation(id); }
+      async *sendMessage(_id: string, _request: SendMessageRequest): AsyncIterable<ChatEvent> {
+        throw new ChatGatewayError("network", "暂时无法连接本地服务，请检查服务状态后重试。");
+      }
+    }
+    const user = userEvent.setup();
+    render(<ChatWorkspace gateway={new FailSendGateway()} />);
+    await createSession(user);
+    const input = screen.getByLabelText("输入装修需求");
+    await user.type(input, "测试重试");
+    await user.click(screen.getByRole("button", { name: "发送消息" }));
+    await screen.findByRole("alert");
+    await user.type(input, "新内容");
+    await user.click(screen.getByRole("button", { name: "重试" }));
+    await waitFor(() => expect(screen.getByLabelText("输入装修需求")).toHaveValue("新内容"));
+  });
+});

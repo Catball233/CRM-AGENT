@@ -54,11 +54,18 @@ describe("QuoteCard", () => {
     expect(screen.getByText(validQuoteResult.disclaimer)).toBeInTheDocument();
   });
 
-  it("hides internal traceability fields (rule_ref, rule_versions, evidence ids)", () => {
+  it("shows rule versions and evidence references per #17 acceptance scope", () => {
     const { container } = render(<QuoteCard quote={validQuoteResult} />);
-    expect(container.textContent).not.toContain("RULE-WHOLE-MID-001");
+    expect(screen.getByText("规则版本")).toBeInTheDocument();
+    expect(container.textContent).toContain("RULE-WHOLE-MID-001");
+    expect(screen.getByText("证据引用")).toBeInTheDocument();
+    expect(container.textContent).toContain(validQuoteResult.knowledge_evidence_ids[0]!.slice(0, 8));
     expect(container.textContent).not.toContain(validQuoteResult.rule_versions[0]!.rule_version_id);
-    expect(container.textContent).not.toContain(validQuoteResult.knowledge_evidence_ids[0]!);
+  });
+
+  it("maps material_tier to a Chinese label", () => {
+    render(<QuoteCard quote={validQuoteResult} />);
+    expect(screen.getByText("中档")).toBeInTheDocument();
   });
 });
 
