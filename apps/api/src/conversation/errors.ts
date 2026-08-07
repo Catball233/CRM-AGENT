@@ -38,6 +38,12 @@ export function apiError(
     | "MODEL_UNAVAILABLE"
     | "KNOWLEDGE_UNAVAILABLE"
     | "PERSISTENCE_ERROR"
+    | "TURN_NOT_FOUND"
+    | "CONVERSATION_BUSY"
+    | "IDEMPOTENCY_KEY_REUSED"
+    | "TURN_RETRY_REQUIRED"
+    | "TURN_NOT_RETRYABLE"
+    | "INTERRUPTED_BY_RESTART"
     | "INTERNAL_ERROR",
   message: string,
   retryable: boolean,
@@ -62,6 +68,26 @@ export function invalidRequest(message = "请求不符合本地 MVP 接口要求
 
 export function conversationNotFound(): ApiException {
   return apiError(HttpStatus.NOT_FOUND, "CONVERSATION_NOT_FOUND", "未找到指定会话。", false);
+}
+
+export function turnNotFound(): ApiException {
+  return apiError(HttpStatus.NOT_FOUND, "TURN_NOT_FOUND", "未找到指定 turn。", false);
+}
+
+export function conversationBusy(): ApiException {
+  return apiError(HttpStatus.CONFLICT, "CONVERSATION_BUSY", "当前会话已有消息正在处理中。", true);
+}
+
+export function idempotencyKeyReused(): ApiException {
+  return apiError(HttpStatus.CONFLICT, "IDEMPOTENCY_KEY_REUSED", "消息标识已被不同内容使用。", false);
+}
+
+export function turnRetryRequired(): ApiException {
+  return apiError(HttpStatus.CONFLICT, "TURN_RETRY_REQUIRED", "失败 turn 必须通过 retry 接口重试。", true);
+}
+
+export function turnNotRetryable(): ApiException {
+  return apiError(HttpStatus.CONFLICT, "TURN_NOT_RETRYABLE", "该 turn 当前不可重试。", false);
 }
 
 export function invalidAiOutput(message = "上游输出不符合契约要求。"): ApiException {

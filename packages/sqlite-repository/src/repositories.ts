@@ -884,7 +884,7 @@ export class PersistenceUnitOfWork {
     private readonly hooks?: TransactionHooks,
   ) {}
 
-  completeTurn(input: CompleteTurnInput): PersistedTurn {
+  completeTurn(input: CompleteTurnInput, afterQuoteSaved?: () => void): PersistedTurn {
     const completion = CompleteTurnInputSchema.parse(input);
     return inTransaction(this.database, () => {
       const processing = requiredRow(
@@ -919,6 +919,7 @@ export class PersistenceUnitOfWork {
           quote: completion.quote_outcome.quote,
         });
       }
+      afterQuoteSaved?.();
       this.hooks?.afterStep?.("turn_complete", "quote_saved");
 
       assertAssistantEvidenceBelongsToTurn(

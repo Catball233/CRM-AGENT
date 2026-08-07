@@ -225,6 +225,56 @@ afterEach(() => {
 });
 
 describe("C-05 deterministic quote engine", () => {
+  it("previews supplied evidence without leaving quote or evidence rows behind", () => {
+    const db = database();
+    try {
+      baseSetup(db);
+      db.prepare("DELETE FROM knowledge_evidence WHERE evidence_id = ?").run(ids.evidence);
+      const preview = new DeterministicQuoteEngine(db, config).preview(quoteInput(), [{
+        contract_version: "1.0.0",
+        evidence_id: ids.evidence,
+        knowledge_base_id: "fixture-kb",
+        document_id: "fixture-doc",
+        document_version: "0.2.0",
+        chunk_id: "preview-chunk",
+        title: "预览报价依据",
+        excerpt: "仅用于预览测试。",
+        score: 0.9,
+        metadata: {},
+        candidate_rule_ids: ["FIXTURE-C05-DESIGN-STANDARD"],
+      }]);
+      expect(preview.outcome).toMatchObject({ kind: "quote" });
+      expect(db.prepare("SELECT COUNT(*) AS count FROM knowledge_evidence").get()).toEqual({ count: 0 });
+      expect(db.prepare("SELECT COUNT(*) AS count FROM quote_versions").get()).toEqual({ count: 0 });
+      expect(db.prepare("SELECT COUNT(*) AS count FROM quote_internal_calculations").get()).toEqual({ count: 0 });
+    } finally {
+      db.close();
+    }
+  });
+
+  it("isolates a preview with a savepoint when its caller owns the transaction", () => {
+    const db = database();
+    try {
+      baseSetup(db);
+      db.prepare("DELETE FROM knowledge_evidence WHERE evidence_id = ?").run(ids.evidence);
+      db.exec("BEGIN IMMEDIATE");
+      db.prepare("UPDATE conversations SET stage = 'QUALIFYING' WHERE conversation_id = ?").run(ids.conversation);
+      const preview = new DeterministicQuoteEngine(db, config).preview(quoteInput(), [{
+        contract_version: "1.0.0", evidence_id: ids.evidence, knowledge_base_id: "fixture-kb",
+        document_id: "fixture-doc", document_version: "0.2.0", chunk_id: "nested-preview",
+        title: "嵌套预览依据", excerpt: "仅用于事务测试。", score: 0.9, metadata: {},
+        candidate_rule_ids: ["FIXTURE-C05-DESIGN-STANDARD"],
+      }]);
+      expect(preview.outcome).toMatchObject({ kind: "quote" });
+      db.exec("COMMIT");
+      expect(db.prepare("SELECT stage FROM conversations WHERE conversation_id = ?").get(ids.conversation)).toEqual({ stage: "QUALIFYING" });
+      expect(db.prepare("SELECT COUNT(*) AS count FROM quote_versions").get()).toEqual({ count: 0 });
+    } finally {
+      if (db.isTransaction) db.exec("ROLLBACK");
+      db.close();
+    }
+  });
+
   it("matches the manually reconciled area quote using integer fen", () => {
     const db = database();
     try {
