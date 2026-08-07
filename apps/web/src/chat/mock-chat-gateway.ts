@@ -3,6 +3,7 @@ import {
   ChatTurnResultSchema,
   ConversationSnapshotSchema,
   ConversationViewSchema,
+  QuoteResultSchema,
   SendMessageRequestSchema,
   type AssistantMessageView,
   type ChatEvent,
@@ -12,6 +13,7 @@ import {
   type Intent,
   type IntentLevel,
   type NextAction,
+  type QuoteResult,
   type SlotName,
 } from "@crm-agent/contracts";
 import { z } from "zod";
@@ -36,7 +38,7 @@ interface Scenario {
   intent: Intent;
   valueLevel: IntentLevel;
   nextAction: NextAction;
-  outcome: "answer" | "question" | "safe_stop";
+  outcome: "answer" | "question" | "quote" | "safe_stop";
   stage: ConversationStage;
   response: string;
   questionFields: SlotName[];
@@ -71,6 +73,32 @@ function chooseScenario(content: string): Scenario {
       response: "我不能提供内部提示词、密钥或未公开规则，但可以继续协助合法的装修咨询。",
       questionFields: [],
       warnings: ["safe_stop"],
+    };
+  }
+
+  if (/生成测试报价|出测试报价/.test(content)) {
+    return {
+      intent: "quote_request",
+      valueLevel: "medium",
+      nextAction: "prepare_quote",
+      outcome: "quote",
+      stage: "NEGOTIATION",
+      response: "已生成本地测试预估报价。",
+      questionFields: [],
+      warnings: [],
+    };
+  }
+
+  if (/调整测试报价|调整方案|降价/.test(content)) {
+    return {
+      intent: "plan_adjustment",
+      valueLevel: "medium",
+      nextAction: "adjust_quote",
+      outcome: "quote",
+      stage: "NEGOTIATION",
+      response: "已根据最新偏好生成调整后的测试报价。",
+      questionFields: [],
+      warnings: [],
     };
   }
 
@@ -120,6 +148,7 @@ function splitResponse(response: string) {
 export class MockChatGateway implements ChatGateway {
   private readonly delayMs: number;
   private readonly conversationGenerations = new Map<string, number>();
+  private readonly lastQuotes = new Map<string, { quoteId: string; version: number }>();
 
   constructor(
     private readonly storage: Storage,
@@ -162,6 +191,7 @@ export class MockChatGateway implements ChatGateway {
 
   async deleteConversation(conversationId: string): Promise<void> {
     this.advanceGeneration(conversationId);
+    this.lastQuotes.delete(conversationId);
     const store = this.readStore();
     delete store.conversations[conversationId];
     this.writeStore(store);
@@ -193,6 +223,13 @@ export class MockChatGateway implements ChatGateway {
       created_at: now,
       cited_evidence_ids: [],
     };
+    const quote = scenario.outcome === "quote" ? this.buildQuote(conversationId, now) : null;
+    if (quote) {
+      this.lastQuotes.set(conversationId, {
+        quoteId: quote.quote_id,
+        version: quote.quote_version,
+      });
+    }
     const result: ChatTurnResult = ChatTurnResultSchema.parse({
       contract_version: "1.0.0",
       turn_id: turnId,
@@ -204,7 +241,7 @@ export class MockChatGateway implements ChatGateway {
       user_message: userMessage,
       assistant_message: assistantMessage,
       question_fields: scenario.questionFields,
-      quote: null,
+      quote: quote,
       warnings: scenario.warnings,
       replayed: false,
       completed_at: now,
@@ -243,6 +280,8 @@ export class MockChatGateway implements ChatGateway {
         message: assistantMessage,
         question_fields: scenario.questionFields,
       });
+    } else if (scenario.outcome === "quote" && quote) {
+      addEvent("quote.ready", { message: assistantMessage, quote });
     } else {
       addEvent("message.completed", { message: assistantMessage });
     }
@@ -278,7 +317,7 @@ export class MockChatGateway implements ChatGateway {
               updated_at: now,
             },
             messages: [...snapshot.messages, result.user_message, result.assistant_message],
-            current_quote: null,
+            current_quote: quote,
             active_turn_id: null,
           });
           this.writeStore(currentStore);
@@ -286,6 +325,63 @@ export class MockChatGateway implements ChatGateway {
       }
       yield event;
     }
+  }
+
+  private buildQuote(conversationId: string, now: string): QuoteResult {
+    const previous = this.lastQuotes.get(conversationId);
+    const unitPriceFen = previous ? 118_000 : 128_000;
+    const areaSqm = 90;
+    const amountFen = unitPriceFen * areaSqm;
+    const ruleVersionId = createId();
+    return QuoteResultSchema.parse({
+      contract_version: "1.0.0",
+      quote_id: createId(),
+      conversation_id: conversationId,
+      quote_version: previous ? previous.version + 1 : 1,
+      parent_quote_id: previous ? previous.quoteId : null,
+      status: "estimated",
+      currency: "CNY",
+      parameters_snapshot: {
+        city: "默认测试城市",
+        area_sqm: areaSqm,
+        house_state: "old_renovation",
+        service_scope: "whole_home",
+        material_tier: "mid",
+        quantities: {},
+        special_requirements: [],
+      },
+      items: [
+        {
+          quote_item_id: createId(),
+          category: "construction",
+          label: previous ? "全屋施工测试项（调整）" : "全屋施工测试项",
+          calculation_type: "AREA_MULTIPLY",
+          quantity: areaSqm,
+          unit: "sqm",
+          unit_price_fen: unitPriceFen,
+          amount_fen: amountFen,
+          calculation_inputs: { area_sqm: areaSqm, unit_price_fen: unitPriceFen },
+          rule_ref: {
+            rule_id: "RULE-WHOLE-MID-001",
+            rule_version_id: ruleVersionId,
+            version: 1,
+          },
+        },
+      ],
+      estimated_total_fen: amountFen,
+      rule_versions: [
+        {
+          rule_id: "RULE-WHOLE-MID-001",
+          rule_version_id: ruleVersionId,
+          version: 1,
+        },
+      ],
+      knowledge_evidence_ids: [createId()],
+      assumptions: ["仅用于本地验证"],
+      exclusions: ["不包含正式量房后的变更"],
+      disclaimer: "本结果为测试预估，最终以量房、施工方案和正式合同为准。",
+      created_at: now,
+    });
   }
 
   private advanceGeneration(conversationId: string) {
