@@ -4,3 +4,5 @@ export const KNOWLEDGE_PROVIDER = Symbol("KNOWLEDGE_PROVIDER");
 export const MEMORY_SERVICE = Symbol("MEMORY_SERVICE");
 export const QUOTE_SERVICE = Symbol("QUOTE_SERVICE");
 export const API_LOGGER = Symbol("API_LOGGER");
+export const TURN_LIFECYCLE_STORE = Symbol("TURN_LIFECYCLE_STORE");
+export const SQLITE_DATABASE = Symbol("SQLITE_DATABASE");

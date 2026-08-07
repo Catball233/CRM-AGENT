@@ -23,6 +23,13 @@ import {
   type RulePresentation,
 } from "./schemas";
 
+/** A calculated C-05 result which has not been permanently written yet. */
+export interface DeterministicQuotePreview {
+  outcome: QuoteOutcome;
+  /** Must run after the public quote has been saved, inside the caller's transaction. */
+  commit(): void;
+}
+
 type Row = Record<string, unknown>;
 type RuleDefinition = ReturnType<typeof RuleDefinitionSchema.parse>;
 
@@ -448,6 +455,62 @@ export class DeterministicQuoteEngine {
       this.hooks?.afterStep?.("promotions_saved");
       return QuoteOutcomeSchema.parse({ kind: "quote", quote: quoteRepository.get(quote.conversation_id, quoteId) });
     });
+  }
+
+  /**
+   * Calculates against supplied, not-yet-committed evidence. All temporary
+   * rows are rolled back; `commit` writes only the C-05 private ledger and is
+   * intended to be invoked by the A-04 completion unit of work.
+   */
+  preview(input: DeterministicQuoteInput, evidence: Array<{
+    evidence_id: string; contract_version: "1.0.0"; knowledge_base_id: string;
+    document_id: string; document_version: string; chunk_id: string; title: string;
+    excerpt: string; score: number; metadata: Record<string, unknown>; candidate_rule_ids: string[];
+  }>): DeterministicQuotePreview {
+    const nested = this.database.isTransaction;
+    if (nested) this.database.exec("SAVEPOINT c05_quote_preview");
+    else this.database.exec("BEGIN IMMEDIATE");
+    try {
+      const insert = this.database.prepare(`INSERT INTO knowledge_evidence (
+        evidence_id, conversation_id, turn_id, contract_version, knowledge_base_id, document_id,
+        document_version, chunk_id, title, excerpt, score, metadata_json, candidate_rule_ids_json, provider_request_id, created_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?)`);
+      for (const item of evidence) {
+        insert.run(item.evidence_id, input.request.conversation_id, input.request.turn_id, item.contract_version,
+          item.knowledge_base_id, item.document_id, item.document_version, item.chunk_id, item.title, item.excerpt,
+          item.score, JSON.stringify(item.metadata), JSON.stringify(item.candidate_rule_ids), input.request.requested_at);
+      }
+      const outcome = this.quote(input);
+      const internal = outcome.kind === "quote" ? this.getInternalCalculation(outcome.quote.quote_id) : null;
+      if (nested) {
+        this.database.exec("ROLLBACK TO c05_quote_preview");
+        this.database.exec("RELEASE c05_quote_preview");
+      } else {
+        this.database.exec("ROLLBACK");
+      }
+      return {
+        outcome,
+        commit: () => {
+          if (!internal) return;
+          this.insertInternalCalculation(internal);
+          for (const item of internal.cost_items) this.insertCostItem(internal.quote_id, item);
+          for (const promotion of internal.applied_promotions) {
+            this.database.prepare(`INSERT INTO quote_promotion_links (
+              quote_id, promotion_rule_version_id, approved_discount_fen, internal_benefit_cost_fen
+            ) VALUES (?, ?, ?, ?)`)
+              .run(internal.quote_id, promotion.promotion_rule_version_id, promotion.approved_discount_fen, promotion.internal_benefit_cost_fen);
+          }
+        },
+      };
+    } catch (error) {
+      if (nested) {
+        this.database.exec("ROLLBACK TO c05_quote_preview");
+        this.database.exec("RELEASE c05_quote_preview");
+      } else {
+        this.database.exec("ROLLBACK");
+      }
+      throw error;
+    }
   }
 
   getInternalCalculation(quoteId: string): InternalQuoteCalculation {

@@ -7,6 +7,7 @@ import {
 } from "@crm-agent/contracts";
 import type {
   AnalysisResult,
+  AssistantMessageView,
   ChatTurnResult,
   ContextBundle,
   ConversationView,
@@ -63,7 +64,8 @@ export interface MemoryService {
 }
 
 export interface QuoteService {
-  calculate(input: QuoteRequest): Promise<QuoteOutcome>;
+  calculate(input: QuoteRequest, evidence?: import("@crm-agent/contracts").KnowledgeEvidence[]): Promise<QuoteOutcome>;
+  take_commit?(turnId: string): (() => void) | undefined;
 }
 
 /** Deliberately excludes customer text, knowledge excerpts, secrets and paths. */
@@ -87,4 +89,49 @@ export interface ApiLogger {
 /** Reserved for the A-04 persistence implementation. */
 export interface CompletedTurnStore {
   result: ChatTurnResult;
+}
+
+/**
+ * A-04 private boundary. Implementations perform only local persistence
+ * operations; model, knowledge and quote calls must remain outside its
+ * transactions.
+ */
+export interface TurnLifecycleStore {
+  begin(input: {
+    conversation_id: string;
+    client_message_id: string;
+    content: string;
+  }): Promise<
+    | { kind: "started"; turn_id: string; user_message: import("@crm-agent/contracts").UserMessageView }
+    | { kind: "processing"; turn_id: string; client_message_id: string }
+    | { kind: "completed"; result: ChatTurnResult }
+    | { kind: "failed"; turn_id: string; retryable: boolean }
+  >;
+  complete(input: {
+    conversation_id: string;
+    turn_id: string;
+    final_stage: import("@crm-agent/contracts").ConversationStage;
+    analysis: AnalysisResult;
+    memory_plan: MemoryMutationPlan;
+    knowledge_evidence: import("@crm-agent/contracts").KnowledgeEvidence[];
+    quote_outcome: QuoteOutcome | null;
+    quote_commit?: () => void;
+    assistant_message: AssistantMessageView;
+  }): Promise<ChatTurnResult>;
+  fail(input: {
+    conversation_id: string;
+    turn_id: string;
+    error_code: string;
+    retryable: boolean;
+  }): Promise<void>;
+  retry(input: {
+    conversation_id: string;
+    turn_id: string;
+    retry_request_id: string;
+  }): Promise<
+    | { kind: "started"; client_message_id: string; content: string }
+    | { kind: "processing"; client_message_id: string }
+    | { kind: "completed"; result: ChatTurnResult }
+  >;
+  recover_interrupted(): Promise<number>;
 }

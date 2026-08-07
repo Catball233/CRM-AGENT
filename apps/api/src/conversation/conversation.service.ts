@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import { Inject, Injectable } from "@nestjs/common";
+import { Inject, Injectable, Optional, type OnModuleInit } from "@nestjs/common";
 import {
   AnalysisResultSchema,
   AnalysisRequestSchema,
@@ -18,6 +18,7 @@ import {
   QuoteRequestSchema,
   ReplyGenerationRequestSchema,
   ReplyDraftSchema,
+  RetryTurnRequestSchema,
   SendMessageRequestSchema,
   UserMessageViewSchema,
 } from "@crm-agent/contracts";
@@ -36,7 +37,12 @@ import {
   invalidRequest,
   KnowledgeUnavailableError,
   PersistenceError,
-  type ApiException,
+  ApiException,
+  conversationBusy,
+  idempotencyKeyReused,
+  turnNotRetryable,
+  turnNotFound,
+  turnRetryRequired,
 } from "./errors";
 import type {
   AiProvider,
@@ -45,6 +51,7 @@ import type {
   KnowledgeProvider,
   MemoryService,
   QuoteService,
+  TurnLifecycleStore,
 } from "./ports";
 import {
   AI_PROVIDER,
@@ -53,6 +60,7 @@ import {
   KNOWLEDGE_PROVIDER,
   MEMORY_SERVICE,
   QUOTE_SERVICE,
+  TURN_LIFECYCLE_STORE,
 } from "./tokens";
 import { transitionStage } from "./state-machine";
 
@@ -60,12 +68,13 @@ type ConversationSnapshot = Awaited<ReturnType<ConversationRepository["get_snaps
 
 export type MessageProcessingResult =
   | { kind: "completed"; result: ChatTurnResult; events: ChatEvent[] }
+  | { kind: "processing"; turn_id: string; client_message_id: string; events: ChatEvent[] }
   | { kind: "failed"; error: ApiException; events: ChatEvent[] };
 
 export type ChatEventSink = (event: ChatEvent) => void | Promise<void>;
 
 @Injectable()
-export class ConversationService {
+export class ConversationService implements OnModuleInit {
   constructor(
     @Inject(CONVERSATION_REPOSITORY) private readonly conversations: ConversationRepository,
     @Inject(AI_PROVIDER) private readonly ai: AiProvider,
@@ -73,7 +82,14 @@ export class ConversationService {
     @Inject(MEMORY_SERVICE) private readonly memory: MemoryService,
     @Inject(QUOTE_SERVICE) private readonly quote: QuoteService,
     @Inject(API_LOGGER) private readonly logger: ApiLogger,
+    @Optional() @Inject(TURN_LIFECYCLE_STORE) private readonly lifecycle?: TurnLifecycleStore,
   ) {}
+
+  async onModuleInit() {
+    if (!this.lifecycle) return;
+    const recovered = await this.lifecycle.recover_interrupted();
+    if (recovered > 0) this.logger.warn("turns.recovered_after_restart", {});
+  }
 
   async create(body: unknown) {
     const request = this.parseCreateRequest(body);
@@ -106,10 +122,47 @@ export class ConversationService {
     return this.parseSendMessageRequest(body).response_mode;
   }
 
-  /** Validates request and conversation state before an SSE response is opened. */
-  async validateSubmission(conversationId: string, body: unknown): Promise<void> {
+  /** Durable turns must be acquired before opening an SSE response so a duplicate can return HTTP 202. */
+  usesDurableTurnLifecycle(): boolean {
+    return this.lifecycle !== undefined;
+  }
+
+  /**
+   * Acquires a durable turn before HTTP opens an SSE response. This preserves
+   * HTTP 202 for an already-processing duplicate without putting providers in
+   * a transaction or delaying the first SSE event for a new turn.
+   */
+  async prepareDurableStreamSubmission(conversationId: string, body: unknown, idempotencyKey?: string) {
+    if (!this.lifecycle) throw invalidRequest("当前运行时未启用本地 SQLite turn 生命周期。");
     const id = this.parseId(conversationId);
     const request = this.parseSendMessageRequest(body);
+    this.assertIdempotencyKey(request.client_message_id, idempotencyKey);
+    const snapshot = await this.findSnapshot(id);
+    if (snapshot.contract_version !== request.contract_version) {
+      throw invalidRequest("请求版本与会话版本不一致。");
+    }
+    if (snapshot.conversation.status === "CLOSED") {
+      throw invalidRequest("已关闭会话不能继续提交消息。");
+    }
+    try {
+      const begun = await this.lifecycle.begin({
+        conversation_id: id,
+        client_message_id: request.client_message_id,
+        content: request.content,
+      });
+      if (begun.kind === "failed") throw turnRetryRequired();
+      return begun;
+    } catch (error) {
+      if (error instanceof ApiException) throw error;
+      throw this.mapLifecycleError(error);
+    }
+  }
+
+  /** Validates request and conversation state before an SSE response is opened. */
+  async validateSubmission(conversationId: string, body: unknown, idempotencyKey?: string): Promise<void> {
+    const id = this.parseId(conversationId);
+    const request = this.parseSendMessageRequest(body);
+    this.assertIdempotencyKey(request.client_message_id, idempotencyKey);
     const snapshot = await this.findSnapshot(id);
     if (snapshot.contract_version !== request.contract_version) {
       throw invalidRequest("请求版本与会话版本不一致。");
@@ -123,9 +176,12 @@ export class ConversationService {
     conversationId: string,
     body: unknown,
     onEvent?: ChatEventSink,
+    idempotencyKey?: string,
+    resumed?: { turn_id: string; user_message: ReturnType<typeof UserMessageViewSchema.parse> },
   ): Promise<MessageProcessingResult> {
     const id = this.parseId(conversationId);
     const request = this.parseSendMessageRequest(body);
+    this.assertIdempotencyKey(request.client_message_id, idempotencyKey);
     const snapshot = await this.findSnapshot(id);
     if (snapshot.contract_version !== request.contract_version) {
       throw invalidRequest("请求版本与会话版本不一致。");
@@ -134,7 +190,7 @@ export class ConversationService {
       throw invalidRequest("已关闭会话不能继续提交消息。");
     }
 
-    const turnId = randomUUID();
+    let turnId = randomUUID();
     const requestId = randomUUID();
     const startedAt = Date.now();
     const events: ChatEvent[] = [];
@@ -161,14 +217,46 @@ export class ConversationService {
       }
     };
 
-    await emitEvent("turn.accepted", { client_message_id: request.client_message_id, replayed: false });
-    const userMessage = UserMessageViewSchema.parse({
+    let userMessage = UserMessageViewSchema.parse({
       message_id: randomUUID(),
       role: "user",
       content: request.content,
       sequence: snapshot.messages.length + 1,
       created_at: new Date().toISOString(),
     });
+
+    if (resumed) {
+      turnId = IdSchema.parse(resumed.turn_id) as ReturnType<typeof randomUUID>;
+      userMessage = resumed.user_message;
+    } else if (this.lifecycle) {
+      try {
+        const begun = await this.lifecycle.begin({
+          conversation_id: id,
+          client_message_id: request.client_message_id,
+          content: request.content,
+        });
+        if (begun.kind === "completed") {
+          turnId = IdSchema.parse(begun.result.turn_id) as ReturnType<typeof randomUUID>;
+          await emitEvent("turn.accepted", { client_message_id: request.client_message_id, replayed: true });
+          const replayed = ChatTurnResultSchema.parse({ ...begun.result, replayed: true });
+          await emitEvent("turn.completed", { result: replayed });
+          return { kind: "completed", result: replayed, events };
+        }
+        if (begun.kind === "processing") {
+          turnId = IdSchema.parse(begun.turn_id) as ReturnType<typeof randomUUID>;
+          return { kind: "processing", turn_id: turnId, client_message_id: begun.client_message_id, events };
+        }
+        if (begun.kind === "failed") {
+          throw turnRetryRequired();
+        }
+        turnId = IdSchema.parse(begun.turn_id) as ReturnType<typeof randomUUID>;
+        userMessage = begun.user_message;
+      } catch (error) {
+        if (error instanceof ApiException) throw error;
+        throw this.mapLifecycleError(error);
+      }
+    }
+    await emitEvent("turn.accepted", { client_message_id: request.client_message_id, replayed: false });
 
     try {
       const context = ContextBundleSchema.parse(
@@ -197,6 +285,7 @@ export class ConversationService {
           userMessage,
           turnId,
           request.client_message_id,
+          analysis,
           events,
           emitEvent,
         );
@@ -251,6 +340,7 @@ export class ConversationService {
       const quoteParameters = needsQuote
         ? this.quoteParametersOrUnavailable(context, analysis.slot_updates)
         : null;
+      let quoteCommit: (() => void) | undefined;
       const quoteOutcome: QuoteOutcome | null = !needsQuote
         ? null
         : quoteParameters !== null && "kind" in quoteParameters
@@ -271,8 +361,10 @@ export class ConversationService {
                     knowledge_evidence_ids: evidenceIds,
                     requested_at: new Date().toISOString(),
                   }),
+                  knowledgeResult?.evidence ?? [],
                 ),
               );
+      if (quoteOutcome?.kind === "quote") quoteCommit = this.quote.take_commit?.(turnId);
       this.assertQuoteReferences(
         quoteOutcome,
         id,
@@ -324,19 +416,33 @@ export class ConversationService {
       });
 
       try {
-        await this.conversations.save_snapshot({
-          contract_version: "1.0.0",
-          conversation: {
-            ...snapshot.conversation,
-            stage: nextStage,
-            status: nextStage === "CLOSED" ? "CLOSED" : "ACTIVE",
-            updated_at: result.completed_at,
-          },
-          messages: [...snapshot.messages, userMessage, assistantMessage],
-          current_quote: result.quote ?? snapshot.current_quote,
-          active_turn_id: null,
-        });
-        await this.memory.apply_mutation(memoryPlan);
+        if (this.lifecycle) {
+          await this.lifecycle.complete({
+            conversation_id: id,
+            turn_id: turnId,
+            final_stage: nextStage,
+            analysis,
+            memory_plan: memoryPlan,
+            knowledge_evidence: knowledgeResult?.evidence ?? [],
+            quote_outcome: quoteOutcome,
+            ...(quoteCommit ? { quote_commit: quoteCommit } : {}),
+            assistant_message: assistantMessage,
+          });
+        } else {
+          await this.conversations.save_snapshot({
+            contract_version: "1.0.0",
+            conversation: {
+              ...snapshot.conversation,
+              stage: nextStage,
+              status: nextStage === "CLOSED" ? "CLOSED" : "ACTIVE",
+              updated_at: result.completed_at,
+            },
+            messages: [...snapshot.messages, userMessage, assistantMessage],
+            current_quote: result.quote ?? snapshot.current_quote,
+            active_turn_id: null,
+          });
+          await this.memory.apply_mutation(memoryPlan);
+        }
       } catch {
         throw new PersistenceError();
       }
@@ -364,6 +470,18 @@ export class ConversationService {
       return { kind: "completed", result, events };
     } catch (error) {
       const apiException = asApiException(error);
+      if (this.lifecycle) {
+        try {
+          await this.lifecycle.fail({
+            conversation_id: id,
+            turn_id: turnId,
+            error_code: apiException.body.error.code,
+            retryable: apiException.body.error.retryable,
+          });
+        } catch {
+          // A failed or replayed turn may already have a terminal state. Preserve the safe API error.
+        }
+      }
       await emitEvent("turn.failed", { error: apiException.body.error });
       this.logger.error("turn.failed", {
         request_id: requestId,
@@ -407,6 +525,62 @@ export class ConversationService {
       throw invalidRequest();
     }
     return parsed.data;
+  }
+
+  private assertIdempotencyKey(clientMessageId: string, idempotencyKey?: string) {
+    if (idempotencyKey !== undefined && idempotencyKey !== clientMessageId) {
+      throw invalidRequest("Idempotency-Key 必须等于 client_message_id。");
+    }
+  }
+
+  async retry(conversationId: string, turnId: string, body: unknown, onEvent?: ChatEventSink) {
+    if (!this.lifecycle) {
+      throw invalidRequest("当前运行时未启用本地 SQLite turn 生命周期。");
+    }
+    const id = this.parseId(conversationId);
+    const parsedTurnId = this.parseId(turnId);
+    const request = RetryTurnRequestSchema.safeParse(body);
+    if (!request.success) throw invalidRequest();
+    let restarted: Awaited<ReturnType<TurnLifecycleStore["retry"]>>;
+    try {
+      restarted = await this.lifecycle.retry({
+        conversation_id: id,
+        turn_id: parsedTurnId,
+        retry_request_id: request.data.retry_request_id,
+      });
+    } catch (error) {
+      throw this.mapLifecycleError(error);
+    }
+    if (restarted.kind === "completed") {
+      return { kind: "completed" as const, result: ChatTurnResultSchema.parse({ ...restarted.result, replayed: true }), events: [] };
+    }
+    if (restarted.kind === "processing") {
+      return {
+        kind: "processing" as const,
+        turn_id: parsedTurnId,
+        client_message_id: restarted.client_message_id,
+        events: [],
+      };
+    }
+    const snapshot = await this.findSnapshot(id);
+    const user = snapshot.messages.find((message) => message.message_id === restarted.client_message_id);
+    if (!user || user.role !== "user") throw new PersistenceError();
+    return this.submit(id, {
+      contract_version: request.data.contract_version,
+      client_message_id: restarted.client_message_id,
+      content: restarted.content,
+      response_mode: request.data.response_mode,
+    }, onEvent, undefined, { turn_id: parsedTurnId, user_message: user });
+  }
+
+  private mapLifecycleError(error: unknown): ApiException {
+    const message = error instanceof Error ? error.message : "";
+    if (message.includes("IDEMPOTENCY_KEY_REUSED")) return idempotencyKeyReused();
+    if (message.includes("TURN_NOT_FOUND")) return turnNotFound();
+    if (message.includes("TURN_RETRY_REQUIRED")) return turnRetryRequired();
+    if (message.includes("TURN_NOT_RETRYABLE")) return turnNotRetryable();
+    if (message.includes("CONVERSATION_BUSY") || message.includes("processing turn")) return conversationBusy();
+    return asApiException(new PersistenceError());
   }
 
   private isLocalTestEnvironment() {
@@ -606,6 +780,7 @@ export class ConversationService {
     userMessage: ReturnType<typeof UserMessageViewSchema.parse>,
     turnId: string,
     clientMessageId: string,
+    analysis: ReturnType<typeof AnalysisResultSchema.parse>,
     events: ChatEvent[],
     emitEvent: (eventType: ChatEvent["event_type"], payload: unknown) => Promise<void>,
   ): Promise<MessageProcessingResult> {
@@ -635,7 +810,26 @@ export class ConversationService {
       completed_at: completedAt,
     });
     try {
-      await this.conversations.save_snapshot({
+      if (this.lifecycle) {
+        await this.lifecycle.complete({
+          conversation_id: snapshot.conversation.conversation_id,
+          turn_id: turnId,
+          final_stage: "CLOSED",
+          analysis,
+          memory_plan: MemoryMutationPlanSchema.parse({
+            contract_version: "1.0.0",
+            conversation_id: snapshot.conversation.conversation_id,
+            turn_id: turnId,
+            fact_upserts: [],
+            fact_ids_to_mark_conflicted: [],
+            summary_upsert: null,
+          }),
+          knowledge_evidence: [],
+          quote_outcome: null,
+          assistant_message: assistantMessage,
+        });
+      } else {
+        await this.conversations.save_snapshot({
         contract_version: "1.0.0",
         conversation: {
           ...snapshot.conversation,
@@ -646,7 +840,8 @@ export class ConversationService {
         messages: [...snapshot.messages, userMessage, assistantMessage],
         current_quote: snapshot.current_quote,
         active_turn_id: null,
-      });
+        });
+      }
     } catch {
       throw new PersistenceError();
     }
