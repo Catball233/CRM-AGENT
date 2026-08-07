@@ -239,7 +239,6 @@ export function ChatWorkspace({ gateway: providedGateway }: ChatWorkspaceProps) 
       setError(null);
       setLastResult(null);
       setRetryContent(null);
-      setDraft("");
       setPendingContent(content);
       setStreamedText("");
       const clientMessageId = createClientId();
@@ -296,7 +295,9 @@ export function ChatWorkspace({ gateway: providedGateway }: ChatWorkspaceProps) 
   );
 
   const sendMessage = useCallback(() => {
-    void runSend(draft.trim());
+    const content = draft.trim();
+    setDraft("");
+    void runSend(content);
   }, [draft, runSend]);
 
   const retryLastTurn = useCallback(() => {
@@ -372,7 +373,7 @@ export function ChatWorkspace({ gateway: providedGateway }: ChatWorkspaceProps) 
 
   const visibleMessages = useMemo(() => snapshot?.messages ?? [], [snapshot]);
 
-  const activeQuote = lastResult?.quote ?? snapshot?.current_quote ?? null;
+  const activeQuote = lastResult ? lastResult.quote : (snapshot?.current_quote ?? null);
   const quoteUnavailable =
     lastResult !== null &&
     lastResult.quote === null &&
