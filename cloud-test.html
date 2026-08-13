@@ -1,0 +1,78 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>CRM-AGENT 云端测试部署说明</title>
+  <style>
+    :root { color-scheme: dark; font-family: Inter, "Microsoft YaHei", sans-serif; background: #09111f; color: #e7eefb; }
+    body { max-width: 920px; margin: 0 auto; padding: 40px 20px 72px; line-height: 1.65; }
+    h1 { color: #71d5ff; } h2 { margin-top: 38px; color: #a8c7ff; }
+    code { color: #b8f3d0; } pre { overflow-x: auto; padding: 16px; border-radius: 10px; background: #101b30; border: 1px solid #243653; }
+    .notice { padding: 16px; border-radius: 10px; background: #20203d; border: 1px solid #5f5bc9; }
+    .warn { padding: 16px; border-radius: 10px; background: #382021; border: 1px solid #88464c; }
+    li { margin: 6px 0; }
+  </style>
+</head>
+<body>
+  <h1>CRM-AGENT 云端测试包</h1>
+  <p>本说明与 <code>crm-agent-cloud-test-source.zip</code> 配套。该压缩包包含应用源码、迁移、虚构知识样例及 C06 v1 本地报价规则；不包含 API Key、<code>.env</code>、SQLite 运行库、会话记录、日志、<code>node_modules</code> 或构建缓存。</p>
+
+  <div class="notice">
+    本项目不是单一静态 HTML：网页、NestJS API、SQLite 报价规则和百炼密钥共同构成测试链路。<br>
+    此 HTML 是云测部署说明；实际访问入口是部署后的 Next.js 网页（默认端口 3000）。
+  </div>
+
+  <h2>服务器依赖（Ubuntu 22.04 / 24.04）</h2>
+  <pre>sudo apt-get update
+sudo apt-get install -y curl ca-certificates unzip git build-essential
+
+# 安装 Node.js 24 LTS（也可使用企业已批准的 Node 24 发行版）
+curl -fsSL https://deb.nodesource.com/setup_24.x | sudo -E bash -
+sudo apt-get install -y nodejs
+corepack enable
+corepack prepare pnpm@11.9.0 --activate
+
+node --version
+pnpm --version</pre>
+  <p>若使用 Docker 部署，服务器仅需 Docker Engine 与 Docker Compose v2；但本包当前提供的是 Node.js 直接部署步骤。</p>
+
+  <h2>解压与配置</h2>
+  <pre>unzip crm-agent-cloud-test-source.zip -d crm-agent-cloud-test
+cd crm-agent-cloud-test
+cp .env.example .env
+chmod 600 .env</pre>
+  <p>仅在服务器上的 <code>.env</code> 填入以下真实值，绝不回传、提交或上传该文件：</p>
+  <pre>DASHSCOPE_API_KEY=...
+BAILIAN_WORKSPACE_ID=...
+BAILIAN_KNOWLEDGE_BASE_ID=...
+BAILIAN_KNOWLEDGE_SEARCH_AGENT_ID=...
+BAILIAN_MODEL_ID=qwen3.7-plus
+DATABASE_URL=file:./data/cloud-test.sqlite</pre>
+
+  <h2>安装、建库、启动</h2>
+  <pre>pnpm install --frozen-lockfile
+pnpm db:rebuild
+pnpm build
+
+# 终端 1：仅监听本机，供网页反向代理调用
+pnpm --filter @crm-agent/api start
+
+# 终端 2：对外网页服务
+CRM_AGENT_API_ORIGIN=http://127.0.0.1:3001 \
+  pnpm --filter @crm-agent/web start -- --hostname 0.0.0.0</pre>
+  <p>访问 <code>http://服务器IP:3000</code>。生产测试应使用 HTTPS 反向代理，并且只开放 80/443；不要对公网开放 3001。</p>
+
+  <h2>云端验收</h2>
+  <ol>
+    <li>打开网页并创建测试会话。</li>
+    <li>公共问答：<code>环保材料和施工工期需要注意什么？</code></li>
+    <li>本地报价：<code>上海 90㎡旧房装修，全屋，材料档位演示标准，设计师档位演示标准，给我报价</code>；预期为 96,000 元。</li>
+    <li>混合意图：<code>环保材料怎么选，顺便 90㎡旧房全屋多少钱？</code>；预期转人工路径。</li>
+  </ol>
+
+  <div class="warn">
+    仅用于演示与虚构数据测试。不得输入客户个人信息、真实报价、生产业务规则或任何密钥；云测结束后删除服务器上的 <code>.env</code> 与 <code>data/cloud-test.sqlite</code>。
+  </div>
+</body>
+</html>

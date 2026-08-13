@@ -15,7 +15,7 @@ import {
   type ChatGateway,
   type ConversationSnapshot,
 } from "../chat/chat-gateway";
-import { MockChatGateway } from "../chat/mock-chat-gateway";
+import { HttpChatGateway } from "../chat/http-chat-gateway";
 import {
   EMPTY_SESSION_INDEX,
   loadSessionIndex,
@@ -129,7 +129,7 @@ export function ChatWorkspace({ gateway: providedGateway }: ChatWorkspaceProps) 
     const browserStorage = getBrowserStorage();
     setStorage(browserStorage);
     if (!providedGateway) {
-      setGateway(new MockChatGateway(browserStorage));
+      setGateway(new HttpChatGateway());
     }
   }, [providedGateway]);
 
@@ -283,6 +283,26 @@ export function ChatWorkspace({ gateway: providedGateway }: ChatWorkspaceProps) 
         );
         setRetryContent(null);
       } catch (sendError) {
+        // An SSE connection can be interrupted after the server has accepted
+        // the turn. Query durable state before offering a retry so we do not
+        // submit a duplicate while the original request is still running.
+        try {
+          const recovered = await gateway.getConversation(snapshot.conversation.conversation_id);
+          if (recovered.active_turn_id) {
+            setSnapshot(recovered);
+            setError("消息仍在服务端处理中，请稍候完成后刷新会话；请勿重复提交。");
+            setRetryContent(null);
+            return;
+          }
+          if (recovered.messages.length > snapshot.messages.length) {
+            setSnapshot(recovered);
+            setError(null);
+            setRetryContent(null);
+            return;
+          }
+        } catch {
+          // Preserve the original transport error when recovery is unavailable.
+        }
         setError(getSafeErrorMessage(sendError));
         setRetryContent(content);
       } finally {
@@ -395,7 +415,7 @@ export function ChatWorkspace({ gateway: providedGateway }: ChatWorkspaceProps) 
         </div>
         <div className="topbar-status">
           <span className="status-dot" aria-hidden="true" />
-          模拟 API
+          本地演示 API
           <span className="session-code">会话 {shortSessionId}</span>
         </div>
         <button
@@ -479,10 +499,10 @@ export function ChatWorkspace({ gateway: providedGateway }: ChatWorkspaceProps) 
           ) : !snapshot ? (
             <div className="welcome-state">
               <div className="welcome-orb" aria-hidden="true"><span>AI</span></div>
-              <p className="eyebrow">D-02 LOCAL MVP</p>
+              <p className="eyebrow">LOCAL DEMO</p>
               <h2>让装修需求，从一句话开始</h2>
               <p className="welcome-copy">
-                当前页面使用模拟事件展示意图识别、价值判断、知识介入与上下文恢复，不会产生真实报价。
+                当前页面连接本地 API 与已配置的演示数据；请仅使用虚构或脱敏信息，报价仅作演示预估。
               </p>
               <div className="capability-row" aria-label="MVP 演示能力">
                 {['意图识别', '价值判断', '知识介入', '上下文', '记忆演示'].map((item) => (
@@ -588,15 +608,15 @@ export function ChatWorkspace({ gateway: providedGateway }: ChatWorkspaceProps) 
         </form>
       </section>
 
-      <aside className="analysis-panel" aria-label="模拟分析摘要">
+      <aside className="analysis-panel" aria-label="分析摘要">
         <div className="analysis-heading">
-          <div><p className="eyebrow">LIVE INSIGHTS</p><h2>模拟分析</h2></div>
+          <div><p className="eyebrow">LIVE INSIGHTS</p><h2>分析摘要</h2></div>
           <button type="button" onClick={() => setAnalysisOpen((open) => !open)} aria-expanded={analysisOpen} aria-label={analysisOpen ? "收起分析栏" : "展开分析栏"}>
             {analysisOpen ? "→" : "←"}
           </button>
         </div>
         <div className="analysis-content">
-          <div className="simulation-notice"><span aria-hidden="true">◎</span>本面板仅展示模拟事件，不代表真实客户结论</div>
+          <div className="simulation-notice"><span aria-hidden="true">◎</span>本面板展示模型分析结果，仅用于虚构或脱敏演示，不代表正式客户结论</div>
           <div className="insight-card accent">
             <span>识别意图</span>
             <strong>{analysis ? (INTENT_LABELS[analysis.intent] ?? analysis.intent) : "等待新消息"}</strong>
@@ -629,7 +649,7 @@ export function ChatWorkspace({ gateway: providedGateway }: ChatWorkspaceProps) 
           <section className="confirm-dialog" role="dialog" aria-modal="true" aria-labelledby="clear-dialog-title">
             <span className="dialog-icon" aria-hidden="true">!</span>
             <h2 id="clear-dialog-title">清空当前测试会话？</h2>
-            <p>这会删除该会话在浏览器中的模拟消息，操作无法撤销。</p>
+            <p>这会删除该会话在本地演示数据库中的消息，操作无法撤销。</p>
             <div className="dialog-actions">
               <button type="button" onClick={closeClearDialog} disabled={isBusy}>取消</button>
               <button type="button" className="danger-confirm" onClick={() => void clearConversation()} disabled={isBusy}>确认清空</button>

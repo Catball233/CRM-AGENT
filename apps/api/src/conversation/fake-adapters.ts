@@ -105,6 +105,7 @@ export class FakeAiProvider implements AiProvider {
     const isRiskRequest = /(提示词|密钥|底价|忽略.*规则)/u.test(content);
     const isCompleteQuoteRequest = /(完整报价|可报价)/u.test(content);
     const isQuoteRequest = /(报价|估价|预算|多少钱)/u.test(content);
+    const isPublicFaqQuestion = /(流程|区别|风险|边界|包含哪些|什么时候)/u.test(content);
 
     return AnalysisResultSchema.parse(
       isRiskRequest
@@ -131,7 +132,25 @@ export class FakeAiProvider implements AiProvider {
               prompt_version: "fake-analysis-v1",
             },
           }
-        : isCompleteQuoteRequest
+        : isQuoteRequest && isPublicFaqQuestion
+          ? {
+              contract_version: LOCAL_TEST_CONTRACT_VERSION,
+              intent: "unclear",
+              stage_recommendation: request.context.stage,
+              value_assessment: { level: "unknown", evidence_refs: [], reason_codes: ["mixed_intent_human_handoff"] },
+              concerns: [],
+              slot_updates: [],
+              missing_fields: [],
+              recommended_next_action: "stop_sales_guidance",
+              knowledge_decision: { should_search: false, reason_codes: ["mixed_intent_human_handoff"], topics: [] },
+              safety_flags: [],
+              model_metadata: {
+                provider: "aliyun_bailian",
+                model_id: "fake-model-v1",
+                prompt_version: "fake-analysis-v1",
+              },
+            }
+          : isCompleteQuoteRequest
           ? {
               contract_version: LOCAL_TEST_CONTRACT_VERSION,
               intent: "quote_request",
@@ -152,10 +171,9 @@ export class FakeAiProvider implements AiProvider {
               missing_fields: [],
               recommended_next_action: "prepare_quote",
               knowledge_decision: {
-                should_search: true,
-                reason_codes: ["quote_rule_lookup"],
-                topics: ["quote_rule"],
-                query_hint: "本地测试报价规则",
+                should_search: false,
+                reason_codes: ["local_quote_rule_lookup"],
+                topics: [],
               },
               safety_flags: [],
               model_metadata: {
@@ -394,7 +412,7 @@ export class FakeQuoteService implements QuoteService {
   async calculate(input: Parameters<QuoteService["calculate"]>[0]) {
     const request = QuoteRequestSchema.parse(input);
     const amountFen = 1_000_000;
-    const ruleId = request.candidate_rule_ids[0]!;
+    const ruleId = request.candidate_rule_ids[0] ?? "RULE-LOCAL-FAKE-001";
 
     const quoteVersion = request.parent_quote_id === undefined
       ? 1

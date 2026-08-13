@@ -1,0 +1,76 @@
+{
+  "format": "json",
+  "metadata": {
+    "contract_version": "1.0.0",
+    "bundle_id": "d6f1de58-fbf1-4b84-9a6f-9d8f03716031",
+    "source_document": "demo-shanghai-public-rule-index-v1.xlsx",
+    "source_version": "1.0.0-demo",
+    "fixture_owner": "DEMO-ONLY-业务负责人",
+    "fixture_reviewer": "DEMO-ONLY-报价审批人",
+    "reconciliation_fixture_ids": [
+      "8673ca39-6c70-4a08-aec0-e231dbbf08c8"
+    ]
+  },
+  "content": "[\n  {\n    \"rule_id\": \"DEMO-SH-DESIGN-AREA-001\",\n    \"version\": 1,\n    \"city\": \"上海\",\n    \"calculation_type\": \"AREA_MULTIPLY\",\n    \"unit_price_fen\": 12000,\n    \"conditions\": {\n      \"service_scope\": \"whole_home\",\n      \"material_tier\": \"demo_standard\",\n      \"designer_tier\": \"demo_standard\"\n    },\n    \"effective_from\": \"2026-08-01T00:00:00Z\"\n  },\n  {\n    \"rule_id\": \"DEMO-SH-MATERIAL-AREA-001\",\n    \"version\": 1,\n    \"city\": \"上海\",\n    \"calculation_type\": \"AREA_MULTIPLY\",\n    \"unit_price_fen\": 88000,\n    \"conditions\": {\n      \"service_scope\": \"whole_home\",\n      \"material_tier\": \"demo_standard\"\n    },\n    \"effective_from\": \"2026-08-01T00:00:00Z\"\n  },\n  {\n    \"rule_id\": \"DEMO-SH-OLDHOME-SURCHARGE-001\",\n    \"version\": 1,\n    \"city\": \"上海\",\n    \"calculation_type\": \"CONDITIONAL_SURCHARGE\",\n    \"amount_fen\": 600000,\n    \"conditions\": {\n      \"service_scope\": \"whole_home\",\n      \"house_state\": \"old_renovation\"\n    },\n    \"effective_from\": \"2026-08-01T00:00:00Z\"\n  }\n]",
+  "source_evidence": [
+    {
+      "source_ref": "demo-shanghai-public-rule-index-v1.xlsx",
+      "document_version": "1.0.0-demo",
+      "chunk_id": "demo-shanghai-design-area-001",
+      "candidate_rule_ids": ["DEMO-SH-DESIGN-AREA-001"]
+    },
+    {
+      "source_ref": "demo-shanghai-public-rule-index-v1.xlsx",
+      "document_version": "1.0.0-demo",
+      "chunk_id": "demo-shanghai-material-area-001",
+      "candidate_rule_ids": ["DEMO-SH-MATERIAL-AREA-001"]
+    },
+    {
+      "source_ref": "demo-shanghai-public-rule-index-v1.xlsx",
+      "document_version": "1.0.0-demo",
+      "chunk_id": "demo-shanghai-oldhome-surcharge-001",
+      "candidate_rule_ids": ["DEMO-SH-OLDHOME-SURCHARGE-001"]
+    }
+  ],
+  "guardrails": [
+    {
+      "rule_id": "DEMO-SH-DESIGN-AREA-001",
+      "minimum_margin_bps": 0,
+      "maximum_discount_bps": 0,
+      "cost_rule_refs": [],
+      "supplier_quote_snapshot_refs": [],
+      "gift_cost_fen": 0,
+      "free_service_cost_fen": 0
+    },
+    {
+      "rule_id": "DEMO-SH-MATERIAL-AREA-001",
+      "minimum_margin_bps": 0,
+      "maximum_discount_bps": 0,
+      "cost_rule_refs": [],
+      "supplier_quote_snapshot_refs": [],
+      "gift_cost_fen": 0,
+      "free_service_cost_fen": 0
+    },
+    {
+      "rule_id": "DEMO-SH-OLDHOME-SURCHARGE-001",
+      "minimum_margin_bps": 0,
+      "maximum_discount_bps": 0,
+      "cost_rule_refs": [],
+      "supplier_quote_snapshot_refs": [],
+      "gift_cost_fen": 0,
+      "free_service_cost_fen": 0
+    }
+  ],
+  "supplier_quote_snapshots": [],
+  "promotion_rules": [],
+  "reconciliation_cases": [
+    {
+      "fixture_id": "8673ca39-6c70-4a08-aec0-e231dbbf08c8",
+      "total_cost_fen": 1,
+      "subtotal_fen": 9600000,
+      "requested_discount_fen": 0,
+      "minimum_margin_bps": 0,
+      "expected_allowed": true
+    }
+  ]
+}

@@ -10,6 +10,8 @@
   },
   "dependencies": {
     "@crm-agent/contracts": "workspace:*",
+    "@crm-agent/knowledge-provider": "workspace:*",
+    "@crm-agent/model-provider": "workspace:*",
     "@crm-agent/sqlite-repository": "workspace:*",
     "@crm-agent/quote-engine": "workspace:*",
     "@nestjs/common": "^11.1.28",

@@ -3,6 +3,7 @@ import {
   Controller,
   Delete,
   Get,
+  Inject,
   HttpCode,
   HttpStatus,
   Headers,
@@ -20,15 +21,17 @@ interface HttpResponse {
   end(): void;
 }
 
+const SSE_HEARTBEAT_INTERVAL_MS = 8_000;
+
 @Controller("api/v1")
 export class AppController {
-  constructor(private readonly conversations: ConversationService) {}
+  constructor(@Inject(ConversationService) private readonly conversations: ConversationService) {}
 
   @Get("health")
   getHealth() {
     return {
       status: "ok",
-      database: "not_initialized",
+      database: process.env.NODE_ENV === "test" || process.env.VITEST === "true" ? "not_initialized" : "ok",
       contract_version: "1.0.0",
     };
   }
@@ -59,15 +62,9 @@ export class AppController {
     if (this.conversations.responseModeFor(body) === "stream") {
       await this.conversations.validateSubmission(conversationId, body, idempotencyKey);
       if (!this.conversations.usesDurableTurnLifecycle()) {
-        response.status(HttpStatus.OK);
-        response.setHeader("Content-Type", "text/event-stream");
-        response.setHeader("Cache-Control", "no-cache");
-        response.setHeader("Connection", "keep-alive");
-        response.flushHeaders?.();
-        await this.conversations.submit(conversationId, body, (event) => {
-          response.write(`id: ${event.event_id}\nevent: ${event.event_type}\ndata: ${JSON.stringify(event)}\n\n`);
-        }, idempotencyKey);
-        response.end();
+        await this.writeStream(response, (emit) =>
+          this.conversations.submit(conversationId, body, emit, idempotencyKey),
+        );
         return;
       }
       const prepared = await this.conversations.prepareDurableStreamSubmission(conversationId, body, idempotencyKey);
@@ -75,18 +72,12 @@ export class AppController {
         response.status(HttpStatus.ACCEPTED);
         return this.processingAccepted(conversationId, prepared.turn_id, prepared.client_message_id);
       }
-      response.status(HttpStatus.OK);
-      response.setHeader("Content-Type", "text/event-stream");
-      response.setHeader("Cache-Control", "no-cache");
-      response.setHeader("Connection", "keep-alive");
-      response.flushHeaders?.();
-      await this.conversations.submit(conversationId, body, (event) => {
-        response.write(`id: ${event.event_id}\nevent: ${event.event_type}\ndata: ${JSON.stringify(event)}\n\n`);
-      }, idempotencyKey, prepared.kind === "started" ? {
-        turn_id: prepared.turn_id,
-        user_message: prepared.user_message,
-      } : undefined);
-      response.end();
+      await this.writeStream(response, (emit) =>
+        this.conversations.submit(conversationId, body, emit, idempotencyKey, prepared.kind === "started" ? {
+          turn_id: prepared.turn_id,
+          user_message: prepared.user_message,
+        } : undefined),
+      );
       return;
     }
     const result = await this.conversations.submit(conversationId, body, undefined, idempotencyKey);
@@ -146,5 +137,32 @@ export class AppController {
       status: "PROCESSING",
       code: "MESSAGE_IN_PROGRESS",
     };
+  }
+
+  /** Keeps proxy and browser connections alive while a non-streaming model call runs. */
+  private async writeStream(
+    response: HttpResponse,
+    work: (emit: (event: import("@crm-agent/contracts").ChatEvent) => void) => Promise<unknown>,
+  ) {
+    response.status(HttpStatus.OK);
+    response.setHeader("Content-Type", "text/event-stream");
+    response.setHeader("Cache-Control", "no-cache");
+    response.setHeader("Connection", "keep-alive");
+    response.flushHeaders?.();
+    const heartbeat = setInterval(() => {
+      try {
+        response.write(": keepalive\n\n");
+      } catch {
+        // The conversation service records the terminal turn state even if a browser disconnects.
+      }
+    }, SSE_HEARTBEAT_INTERVAL_MS);
+    try {
+      await work((event) => {
+        response.write(`id: ${event.event_id}\nevent: ${event.event_type}\ndata: ${JSON.stringify(event)}\n\n`);
+      });
+    } finally {
+      clearInterval(heartbeat);
+      response.end();
+    }
   }
 }

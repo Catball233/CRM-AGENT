@@ -1,6 +1,8 @@
 import { randomUUID } from "node:crypto";
 import { HttpException, HttpStatus } from "@nestjs/common";
 import { ApiErrorSchema } from "@crm-agent/contracts";
+import { KnowledgeProviderError } from "@crm-agent/knowledge-provider";
+import { ModelProviderError } from "@crm-agent/model-provider";
 
 export class ApiException extends Error {
   constructor(
@@ -100,6 +102,14 @@ export function asApiException(error: unknown): ApiException {
   }
   if (error instanceof ModelUnavailableError) {
     return apiError(HttpStatus.SERVICE_UNAVAILABLE, "MODEL_UNAVAILABLE", "模型服务暂不可用，请稍后重试。", true);
+  }
+  if (error instanceof ModelProviderError) {
+    return error.code === "AI_OUTPUT_INVALID"
+      ? invalidAiOutput()
+      : apiError(HttpStatus.SERVICE_UNAVAILABLE, "MODEL_UNAVAILABLE", "模型服务暂不可用，请稍后重试。", error.retryable);
+  }
+  if (error instanceof KnowledgeProviderError) {
+    return apiError(HttpStatus.SERVICE_UNAVAILABLE, "KNOWLEDGE_UNAVAILABLE", "知识服务暂不可用，请稍后重试。", error.retryable);
   }
   if (error instanceof KnowledgeUnavailableError) {
     return apiError(HttpStatus.SERVICE_UNAVAILABLE, "KNOWLEDGE_UNAVAILABLE", "知识服务暂不可用，请稍后重试。", true);

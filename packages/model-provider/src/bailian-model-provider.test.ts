@@ -19,6 +19,7 @@ const providerAnalysisResult = {
     prompt_version: "b-02-v1",
   },
 } as const;
+const { model_metadata: _serverOwnedMetadata, ...modelAnalysisResult } = analysisResult;
 
 const replyRequest: ReplyGenerationRequest = {
   contract_version: "1.0.0",
@@ -57,7 +58,7 @@ const asFetch = (
 describe("BailianModelProvider", () => {
   it("returns an AnalysisResult validated by the public schema", async () => {
     const fetchMock = vi.fn(
-      asFetch(async () => chatCompletionResponse(JSON.stringify(analysisResult))),
+      asFetch(async () => chatCompletionResponse(JSON.stringify(modelAnalysisResult))),
     );
     const provider = createBailianModelProviderFromEnv({
       env: testEnv,
@@ -84,11 +85,18 @@ describe("BailianModelProvider", () => {
     expect(body.max_tokens).toBeUndefined();
     expect(body.messages[0].content.toLowerCase()).toContain("json");
     expect(body.messages[0].content).toContain("Required JSON Schema");
+    expect(body.messages[0].content).toContain("Every field in this exact object shape is mandatory");
+    expect(body.messages[0].content).toContain("Do not add model_metadata");
+    expect(body.messages[0].content).not.toContain('"model_metadata"');
+    expect(body.messages[0].content).toContain('"90㎡" or "90平方米" => area_sqm: 90');
+    expect(body.messages[0].content).toContain('"旧房装修" => house_state: "old_renovation"');
+    expect(body.messages[0].content).toContain('use "QUALIFYING" when context.stage is "DISCOVERY"');
+    expect(body.messages[0].content).toContain('recommended_next_action "prepare_quote"');
   });
 
   it("uses the fixed Aliyun workspace host without accepting an arbitrary credential target", async () => {
     const fetchMock = vi.fn(
-      asFetch(async () => chatCompletionResponse(JSON.stringify(analysisResult))),
+      asFetch(async () => chatCompletionResponse(JSON.stringify(modelAnalysisResult))),
     );
     const provider = createBailianModelProviderFromEnv({
       env: { ...testEnv, BAILIAN_WORKSPACE_ID: "workspace-123" },
@@ -116,6 +124,48 @@ describe("BailianModelProvider", () => {
         env: { ...testEnv, BAILIAN_WORKSPACE_ID: "https://attacker.invalid" },
       }),
     ).toThrowError(expect.objectContaining({ code: "MODEL_CONFIG_INVALID" }));
+    expect(() =>
+      createBailianModelProviderFromEnv({
+        env: { ...testEnv, BAILIAN_MODEL_TIMEOUT_MS: "65 seconds" },
+      }),
+    ).toThrowError(expect.objectContaining({ code: "MODEL_CONFIG_INVALID" }));
+  });
+
+  it("uses BAILIAN_MODEL_TIMEOUT_MS when no explicit timeout option is supplied", async () => {
+    vi.useFakeTimers();
+    try {
+      const fetchMock = vi.fn(
+        asFetch(
+          async (_input, init) =>
+            new Promise<Response>((_resolve, reject) => {
+              init?.signal?.addEventListener("abort", () => {
+                const error = new Error("aborted");
+                error.name = "AbortError";
+                reject(error);
+              });
+            }),
+        ),
+      );
+      const provider = createBailianModelProviderFromEnv({
+        env: { ...testEnv, BAILIAN_MODEL_TIMEOUT_MS: "65000" },
+        fetch: fetchMock,
+        maxAttempts: 1,
+        sleep: async () => undefined,
+      });
+
+      const pending = expect(provider.analyze(analysisRequest)).rejects.toMatchObject({
+        code: "MODEL_UNAVAILABLE",
+        reason: "timeout",
+        attempts: 1,
+      });
+      await vi.advanceTimersByTimeAsync(64_999);
+      expect(fetchMock).toHaveBeenCalledTimes(1);
+
+      await vi.advanceTimersByTimeAsync(1);
+      await pending;
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it("aborts timed-out attempts and stops after the configured limit", async () => {
@@ -190,7 +240,7 @@ describe("BailianModelProvider", () => {
         status: 429,
         headers: { "Retry-After": "0.01", "X-Request-Id": "rate-limit-request" },
       }),
-      chatCompletionResponse(JSON.stringify(analysisResult)),
+      chatCompletionResponse(JSON.stringify(modelAnalysisResult)),
     ];
     const fetchMock = vi.fn(asFetch(async () => responses.shift()!));
     const sleep = vi.fn(async () => undefined);

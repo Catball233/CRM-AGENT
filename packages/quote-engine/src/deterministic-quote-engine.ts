@@ -575,6 +575,9 @@ export class DeterministicQuoteEngine {
   }
 
   private validateEvidence(input: ReturnType<typeof DeterministicQuoteInputSchema.parse>): QuoteOutcome | null {
+    if (input.request.knowledge_evidence_ids.length === 0) {
+      return null;
+    }
     const evidenceRows = input.request.knowledge_evidence_ids.map((evidenceId) => this.database.prepare(`SELECT *
       FROM knowledge_evidence WHERE evidence_id = ? AND conversation_id = ? AND turn_id = ?`)
       .get(evidenceId, input.request.conversation_id, input.request.turn_id) as Row | undefined);

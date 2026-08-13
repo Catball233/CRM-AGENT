@@ -1,4 +1,5 @@
 import { pathToFileURL } from "node:url";
+import { existsSync } from "node:fs";
 import { resolve } from "node:path";
 import type { DatabaseSync } from "node:sqlite";
 
@@ -9,7 +10,10 @@ type SqliteBootstrap = {
 
 /** Opens the local MVP database and applies only the existing numbered migrations. */
 export async function openApiDatabase(): Promise<DatabaseSync> {
-  const root = process.cwd();
+  const workingDirectory = process.cwd();
+  const root = existsSync(resolve(workingDirectory, "database/scripts/sqlite.mjs"))
+    ? workingDirectory
+    : resolve(workingDirectory, "../..");
   const runtimeUrl = pathToFileURL(resolve(root, "database/scripts/sqlite.mjs")).href;
   const runtime = await import(runtimeUrl) as unknown as SqliteBootstrap;
   const configured = process.env.DATABASE_URL ?? "file:./data/local.sqlite";

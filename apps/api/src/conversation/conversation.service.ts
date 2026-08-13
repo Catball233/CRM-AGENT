@@ -62,6 +62,7 @@ import {
   QUOTE_SERVICE,
   TURN_LIFECYCLE_STORE,
 } from "./tokens";
+import { applyCompleteShanghaiDemoQuoteFallback } from "./quote-slot-fallback";
 import { transitionStage } from "./state-machine";
 
 type ConversationSnapshot = Awaited<ReturnType<ConversationRepository["get_snapshot"]>>;
@@ -262,7 +263,7 @@ export class ConversationService implements OnModuleInit {
       const context = ContextBundleSchema.parse(
         await this.memory.build_context(id, userMessage.message_id),
       );
-      const analysis = AnalysisResultSchema.parse(
+      const modelAnalysis = AnalysisResultSchema.parse(
         await this.ai.analyze(
           AnalysisRequestSchema.parse({
           contract_version: "1.0.0",
@@ -272,6 +273,11 @@ export class ConversationService implements OnModuleInit {
           context,
           }),
         ),
+      );
+      const analysis = applyCompleteShanghaiDemoQuoteFallback(
+        modelAnalysis,
+        userMessage,
+        snapshot.conversation.stage,
       );
       await emitEvent("analysis.completed", {
         intent: analysis.intent,
@@ -301,12 +307,13 @@ export class ConversationService implements OnModuleInit {
       const needsQuote =
         analysis.recommended_next_action === "prepare_quote" ||
         analysis.recommended_next_action === "adjust_quote";
+      const isQuoteRoute = this.isQuoteRoute(analysis);
       if (analysis.recommended_next_action === "adjust_quote" && snapshot.current_quote === null) {
         throw invalidAiOutput("调整报价必须基于当前会话中已保存的报价版本。");
       }
-      const shouldSearch = analysis.knowledge_decision.should_search || needsQuote;
+      const shouldSearch = !isQuoteRoute && analysis.knowledge_decision.should_search;
       const knowledgeTopics =
-        analysis.knowledge_decision.topics.length > 0 ? analysis.knowledge_decision.topics : ["quote_rule"];
+        analysis.knowledge_decision.topics.length > 0 ? analysis.knowledge_decision.topics : ["public_faq"];
       const knowledgeResult = shouldSearch
         ? KnowledgeSearchResultSchema.parse(
             await this.knowledge.search(
@@ -345,9 +352,7 @@ export class ConversationService implements OnModuleInit {
         ? null
         : quoteParameters !== null && "kind" in quoteParameters
           ? quoteParameters
-          : candidateRuleIds.length === 0 || evidenceIds.length === 0
-            ? this.quoteUnavailable("knowledge_insufficient")
-            : QuoteOutcomeSchema.parse(
+          : QuoteOutcomeSchema.parse(
                 await this.quote.calculate(
                   QuoteRequestSchema.parse({
                     contract_version: "1.0.0",
@@ -357,11 +362,13 @@ export class ConversationService implements OnModuleInit {
                       ? { parent_quote_id: snapshot.current_quote.quote_id }
                       : {}),
                     confirmed_parameters: quoteParameters,
-                    candidate_rule_ids: candidateRuleIds,
-                    knowledge_evidence_ids: evidenceIds,
+                    // Quote routing is local-only. The SQLite quote service resolves active
+                    // rules from confirmed parameters and never receives public FAQ evidence.
+                    candidate_rule_ids: [],
+                    knowledge_evidence_ids: [],
                     requested_at: new Date().toISOString(),
                   }),
-                  knowledgeResult?.evidence ?? [],
+                  [],
                 ),
               );
       if (quoteOutcome?.kind === "quote") quoteCommit = this.quote.take_commit?.(turnId);
@@ -374,19 +381,26 @@ export class ConversationService implements OnModuleInit {
         snapshot.current_quote,
       );
 
-      const reply = ReplyDraftSchema.parse(
-        await this.ai.compose_reply(
-          ReplyGenerationRequestSchema.parse({
-          contract_version: "1.0.0",
-          conversation_id: id,
-          turn_id: turnId,
-          analysis,
-          context,
-          knowledge_evidence: knowledgeResult?.evidence ?? [],
-          ...(quoteOutcome === null ? {} : { quote_outcome: quoteOutcome }),
-          }),
-        ),
-      );
+      const reply = quoteOutcome?.kind === "quote"
+        ? ReplyDraftSchema.parse({
+            contract_version: "1.0.0",
+            text: "已根据已确认的演示规则生成预估报价，请查看报价卡片中的规则、假设与免责声明。",
+            cited_evidence_ids: [],
+            question_fields: [],
+          })
+        : ReplyDraftSchema.parse(
+            await this.ai.compose_reply(
+              ReplyGenerationRequestSchema.parse({
+              contract_version: "1.0.0",
+              conversation_id: id,
+              turn_id: turnId,
+              analysis,
+              context,
+              knowledge_evidence: knowledgeResult?.evidence ?? [],
+              ...(quoteOutcome === null ? {} : { quote_outcome: quoteOutcome }),
+              }),
+            ),
+          );
       this.assertReplyReferences(reply.cited_evidence_ids, evidenceIds);
       const outcome = this.outcomeFor(analysis.recommended_next_action, quoteOutcome);
       const questionFields = this.questionFieldsFor(outcome, reply.question_fields, quoteOutcome);
@@ -737,7 +751,7 @@ export class ConversationService implements OnModuleInit {
     if (
       quote.conversation_id !== conversationId ||
       quote.knowledge_evidence_ids.some((evidenceId) => !visibleEvidence.has(evidenceId)) ||
-      quote.rule_versions.some((ruleVersion) => !candidateRules.has(ruleVersion.rule_id)) ||
+      (candidateRules.size > 0 && quote.rule_versions.some((ruleVersion) => !candidateRules.has(ruleVersion.rule_id))) ||
       quote.items.some((item) => !quotedRuleVersions.has(ruleVersionKey(item.rule_ref)))
     ) {
       throw invalidAiOutput("报价结果引用了当前轮不可见的会话、证据或规则。");
@@ -775,6 +789,10 @@ export class ConversationService implements OnModuleInit {
     }
   }
 
+  private isQuoteRoute(analysis: ReturnType<typeof AnalysisResultSchema.parse>) {
+    return ["quote_request", "plan_adjustment", "negotiation"].includes(analysis.intent);
+  }
+
   private async completeSafeStop(
     snapshot: NonNullable<ConversationSnapshot>,
     userMessage: ReturnType<typeof UserMessageViewSchema.parse>,
@@ -785,10 +803,16 @@ export class ConversationService implements OnModuleInit {
     emitEvent: (eventType: ChatEvent["event_type"], payload: unknown) => Promise<void>,
   ): Promise<MessageProcessingResult> {
     const completedAt = new Date().toISOString();
+    const isMixedIntentHandoff =
+      analysis.intent === "unclear" &&
+      analysis.recommended_next_action === "stop_sales_guidance" &&
+      analysis.safety_flags.length === 0;
     const assistantMessage = {
       message_id: randomUUID(),
       role: "assistant" as const,
-      content: "我无法协助处理该请求，但可以继续说明公开的本地测试服务范围。",
+      content: isMixedIntentHandoff
+        ? "当前不支持在同一条消息中同时处理装修咨询与报价请求，已转人工继续协助。"
+        : "我无法协助处理该请求，但可以继续说明公开的本地测试服务范围。",
       sequence: userMessage.sequence + 1,
       created_at: completedAt,
       cited_evidence_ids: [],

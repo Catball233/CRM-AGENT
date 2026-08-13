@@ -121,6 +121,23 @@ describe("BailianKnowledgeProvider", () => {
     });
   });
 
+  it("accepts empty Bailian presentation metadata without relaxing trusted identifiers", async () => {
+    const provider = createBailianKnowledgeProviderFromEnv({
+      env,
+      fetch: asFetch(async () => response(envelope([node({}, {
+        doc_name: "",
+        title: "",
+        hier_title: "",
+        nid: "",
+      })]))),
+    });
+
+    await expect(provider.search(request)).resolves.toMatchObject({
+      evidence: [{ document_id: "doc-material-001", candidate_rule_ids: ["MATERIAL-MID-001"] }],
+      rule_candidates: [{ rule_id: "MATERIAL-MID-001" }],
+    });
+  });
+
   it("uses stable evidence IDs for an idempotently repeated turn", async () => {
     const fetchMock = vi.fn(asFetch(async () => response(envelope([node()]))));
     const provider = createBailianKnowledgeProviderFromEnv({ env, fetch: fetchMock });

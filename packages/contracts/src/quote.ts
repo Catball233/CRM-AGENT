@@ -31,8 +31,8 @@ export const QuoteRequestSchema = z
     turn_id: IdSchema,
     parent_quote_id: IdSchema.optional(),
     confirmed_parameters: QuoteParametersSchema,
-    candidate_rule_ids: z.array(z.string().min(1).max(100)).min(1).max(100),
-    knowledge_evidence_ids: z.array(IdSchema).min(1).max(100),
+    candidate_rule_ids: z.array(z.string().min(1).max(100)).max(100),
+    knowledge_evidence_ids: z.array(IdSchema).max(100),
     requested_at: IsoDateTimeSchema,
   })
   .strict();
@@ -87,7 +87,7 @@ export const QuoteResultSchema = z
     items: z.array(QuoteItemSchema).min(1).max(200),
     estimated_total_fen: MoneyFenSchema,
     rule_versions: z.array(RuleVersionRefSchema).min(1).max(200),
-    knowledge_evidence_ids: z.array(IdSchema).min(1).max(100),
+    knowledge_evidence_ids: z.array(IdSchema).max(100),
     assumptions: z.array(z.string().min(1).max(500)).max(50),
     exclusions: z.array(z.string().min(1).max(500)).max(50),
     disclaimer: z.string().min(1).max(1_000),

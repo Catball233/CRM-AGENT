@@ -116,6 +116,8 @@ describe("A-03 session API", () => {
     expect(quoted.outcome).toBe("quote");
     expect(quoted.quote?.estimated_total_fen).toBe(1_000_000);
     expect(quoted.quote?.items).toHaveLength(1);
+    expect(quoted.assistant_message.cited_evidence_ids).toEqual([]);
+    expect(quoted.assistant_message.content).toContain("报价卡片");
   });
 
   it("keeps a complete first-turn quote on the legal discovery-to-qualifying transition", async () => {
@@ -129,6 +131,23 @@ describe("A-03 session API", () => {
     const result = ChatTurnResultSchema.parse(await response.json());
     expect(result.stage).toBe("QUALIFYING");
     expect(result.outcome).toBe("quote");
+  });
+
+  it("routes a mixed public-question and quote request to human handoff", async () => {
+    const conversation = await createConversation();
+    const response = await fetch(
+      baseUrl + "/api/v1/conversations/" + conversation.conversation_id + "/messages",
+      {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify(messageBody("旧房改造有哪些风险，同时上海90㎡全屋装修多少钱？")),
+      },
+    );
+    expect(response.status).toBe(200);
+    const result = ChatTurnResultSchema.parse(await response.json());
+    expect(result.outcome).toBe("safe_stop");
+    expect(result.quote).toBeNull();
+    expect(result.assistant_message.content).toContain("转人工");
   });
 
   it("streams valid, ordered events with one terminal event", async () => {
@@ -342,19 +361,17 @@ describe("A-03 session API", () => {
     expect(logger.records.at(-1)?.fields.duration_ms).toBeGreaterThanOrEqual(10);
   });
 
-  it("returns a safe unavailable result when quote knowledge has no usable rule", async () => {
+  it("does not query public knowledge while calculating a quote from local rules", async () => {
     const repository = new FakeConversationRepository();
+    let knowledgeCalls = 0;
     const service = new ConversationService(
       repository,
       new FakeAiProvider(),
       {
-        search: async () =>
-          KnowledgeSearchResultSchema.parse({
-            contract_version: CONTRACT_VERSION,
-            evidence: [],
-            rule_candidates: [],
-            provider_request_id: "fake-empty-knowledge",
-          }),
+        search: async () => {
+          knowledgeCalls += 1;
+          throw new Error("quote flow must not search public knowledge");
+        },
       },
       new FakeMemoryService(repository),
       new FakeQuoteService(),
@@ -364,11 +381,10 @@ describe("A-03 session API", () => {
     const response = await service.submit(conversation.conversation_id, messageBody("请给我完整报价。"));
     expect(response.kind).toBe("completed");
     if (response.kind === "completed") {
-      expect(response.result.outcome).toBe("answer");
-      expect(response.result.quote).toBeNull();
-      expect(response.result.warnings).toEqual(["knowledge_insufficient"]);
-      expect(response.result.assistant_message.content).toContain("缺少有效的报价依据");
+      expect(response.result.outcome).toBe("quote");
+      expect(response.result.quote?.knowledge_evidence_ids).toEqual([]);
     }
+    expect(knowledgeCalls).toBe(0);
   });
 
   it("uses confirmed history, designer tier, and the previous quote when adjusting a quote", async () => {

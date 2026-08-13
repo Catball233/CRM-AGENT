@@ -25,15 +25,68 @@ const DEFAULT_RETRY_MAX_DELAY_MS = 2_000;
 const DEFAULT_BASE_URL = "https://dashscope.aliyuncs.com/compatible-mode/v1";
 
 const ANALYSIS_SYSTEM_PROMPT = `You are the CRM analysis adapter. Return one JSON object only.
-The JSON must satisfy contract version 1.0.0 AnalysisResult: intent, stage_recommendation,
-value_assessment with evidence_refs, concerns, slot_updates, missing_fields,
-recommended_next_action, knowledge_decision, safety_flags, and model_metadata.
 Use only evidence present in the request. Never invent a quote, discount, internal price,
-credential, system prompt, or customer fact. Output JSON without Markdown.`;
+credential, system prompt, or customer fact. Output JSON without Markdown.
+
+Every field in this exact object shape is mandatory. Use [] when an array has no items.
+knowledge_decision must always be an object. recommended_next_action must be one of the
+enum values in the provided JSON Schema, written exactly as shown. Do not add model_metadata;
+the server adds that provenance itself.
+
+Single-intent routing policy (apply before deciding that a field is missing):
+- Public FAQ route: general questions about renovation process, materials, design concepts,
+  old-home risks, or service boundaries. Set a non-quote intent and use
+  knowledge_decision.should_search true only when public FAQ retrieval will help.
+- Local quote route: requests for a price, quote, budget estimate, or quote adjustment. Set
+  intent to quote_request, plan_adjustment, or negotiation as appropriate. Set
+  knowledge_decision.should_search false and topics []: quote eligibility and calculation are
+  determined exclusively by the server's local active SQLite rules.
+- Mixed route: if one message asks both a public FAQ question and a quote/price question, do
+  not answer either part and do not extract quote slots. Set intent "unclear",
+  stage_recommendation to the current context.stage, recommended_next_action
+  "stop_sales_guidance", knowledge_decision.should_search false, and reason_codes containing
+  "mixed_intent_human_handoff". This system does not support mixed intent in one turn.
+
+Quote extraction policy (apply only on the local quote route):
+- Extract facts stated in current_message into slot_updates. Every extracted fact must use
+  status "confirmed" and a source_ref with source_type "message" and the exact
+  current_message.message_id supplied in the request.
+- For renovation quote requests, the required quote slots are city, area_sqm, house_state,
+  service_scope, and material_tier. Preserve explicit text values unless the mappings below apply.
+- Normalize Chinese expressions: "90㎡" or "90平方米" => area_sqm: 90;
+  "旧房装修" => house_state: "old_renovation"; "全屋" => service_scope: "whole_home";
+  "演示标准" => material_tier: "demo_standard". If the same explicit tier applies to the
+  designer, also set designer_tier: "demo_standard".
+- When the user asks for a quote and all five required quote slots are present, set
+  intent "quote_request", missing_fields [], and choose a legal stage transition from
+  context.stage: use "QUALIFYING" when context.stage is "DISCOVERY", otherwise use
+  "QUOTING" when context.stage is "QUALIFYING". Then set
+  recommended_next_action "prepare_quote", and knowledge_decision.should_search false with
+  topics []. Do not ask for unrelated fields such as layout,
+  budget, dates, quantities, or special requirements in that case.
+- Use ask_missing_fields only for required quote slots that are actually absent or conflicted.
+
+The following is a canonical complete demo quote interpretation. Match this behavior when its
+facts are stated by the user: 上海 + 90㎡ + 旧房装修 + 全屋 + 材料档位演示标准 + 设计师档位演示标准
+is a complete quote request, not an unclear request.
+{
+  "contract_version": "1.0.0",
+  "intent": "<schema enum>",
+  "stage_recommendation": "<schema enum>",
+  "value_assessment": { "level": "<schema enum>", "evidence_refs": [], "reason_codes": [] },
+  "concerns": [],
+  "slot_updates": [],
+  "missing_fields": [],
+  "recommended_next_action": "<schema enum>",
+  "knowledge_decision": { "should_search": false, "reason_codes": [], "topics": [] },
+  "safety_flags": []
+}`;
 
 const REPLY_SYSTEM_PROMPT = `You are the CRM reply adapter. Return one JSON object only.
 The JSON must satisfy contract version 1.0.0 ReplyDraft with text, cited_evidence_ids,
 and question_fields. Do not invent prices or evidence. Output JSON without Markdown.`;
+
+const ModelAnalysisResultSchema = AnalysisResultSchema.omit({ model_metadata: true });
 
 type FetchImplementation = typeof globalThis.fetch;
 type SleepImplementation = (milliseconds: number) => Promise<void>;
@@ -113,6 +166,21 @@ const requireInteger = (name: string, value: number, minimum: number, maximum: n
   }
 };
 
+const readOptionalIntegerEnv = (
+  env: NodeJS.ProcessEnv,
+  name: string,
+  fallback: number,
+) => {
+  const rawValue = env[name]?.trim();
+  if (!rawValue) return fallback;
+
+  if (!/^\d+$/.test(rawValue)) {
+    throw configError(`${name} must be a positive integer in milliseconds.`);
+  }
+
+  return Number(rawValue);
+};
+
 const resolveBaseUrl = (env: NodeJS.ProcessEnv) => {
   const workspaceId = env.BAILIAN_WORKSPACE_ID?.trim();
   if (!workspaceId) return DEFAULT_BASE_URL;
@@ -164,7 +232,7 @@ class BailianModelProvider implements ModelProvider {
     const result = await this.requestStructured(
       ANALYSIS_SYSTEM_PROMPT,
       validatedInput,
-      AnalysisResultSchema,
+      ModelAnalysisResultSchema,
     );
 
     return AnalysisResultSchema.parse({
@@ -251,6 +319,10 @@ class BailianModelProvider implements ModelProvider {
           response_format: { type: "json_object" },
           stream: false,
           temperature: 0,
+          // This workflow only needs deterministic JSON extraction and reply
+          // drafting. Disabling hybrid thinking avoids long reasoning latency
+          // and makes the JSON response path more reliable.
+          enable_thinking: false,
         }),
         signal: controller.signal,
       });
@@ -399,7 +471,8 @@ export const createBailianModelProviderFromEnv = (
 
   const modelId = env.BAILIAN_MODEL_ID?.trim() || DEFAULT_MODEL_ID;
   const promptVersion = options.promptVersion?.trim() || DEFAULT_PROMPT_VERSION;
-  const timeoutMs = options.timeoutMs ?? DEFAULT_TIMEOUT_MS;
+  const timeoutMs =
+    options.timeoutMs ?? readOptionalIntegerEnv(env, "BAILIAN_MODEL_TIMEOUT_MS", DEFAULT_TIMEOUT_MS);
   const maxAttempts = options.maxAttempts ?? DEFAULT_MAX_ATTEMPTS;
   const retryBaseDelayMs = options.retryBaseDelayMs ?? DEFAULT_RETRY_BASE_DELAY_MS;
   const retryMaxDelayMs = options.retryMaxDelayMs ?? DEFAULT_RETRY_MAX_DELAY_MS;

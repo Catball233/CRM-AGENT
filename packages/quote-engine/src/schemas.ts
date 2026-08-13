@@ -81,7 +81,7 @@ export const InternalQuoteCalculationSchema = z.object({
   intent_level: IntentLevelSchema,
   supplier_snapshot_refs: z.array(IdSchema).max(500),
   rule_version_refs: z.array(RuleVersionRefSchema).min(1).max(500),
-  knowledge_evidence_ids: z.array(IdSchema).min(1).max(100),
+  knowledge_evidence_ids: z.array(IdSchema).max(100),
   cost_items: z.array(InternalCostItemSchema).max(2_000),
   applied_promotions: z.array(AppliedPromotionLedgerSchema).max(100),
   validation_codes: z.array(z.string().min(1).max(100)).max(100),

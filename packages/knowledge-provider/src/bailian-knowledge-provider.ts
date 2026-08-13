@@ -23,13 +23,16 @@ const MAX_RESPONSE_CHARACTERS = 5_000_000;
 const BailianMetadataSchema = z
   .object({
     doc_id: z.string().min(1).max(500),
-    doc_name: z.string().min(1).max(1_000).optional(),
-    title: z.string().min(1).max(1_000).optional(),
-    hier_title: z.string().min(1).max(1_000).optional(),
+    // Bailian emits empty strings for presentation-only fields on some Markdown
+    // chunks. They are not trust or routing inputs, so accept them while still
+    // requiring the canonical pipeline_id and doc_id below.
+    doc_name: z.string().max(1_000).optional(),
+    title: z.string().max(1_000).optional(),
+    hier_title: z.string().max(1_000).optional(),
     content: z.string().min(1).optional(),
     pipeline_id: z.string().min(1).max(500),
-    _id: z.string().min(1).max(500).optional(),
-    nid: z.string().min(1).max(500).optional(),
+    _id: z.string().max(500).optional(),
+    nid: z.string().max(500).optional(),
     category: z.string().min(1).optional(),
     city: z.string().min(1).optional(),
     effective_from: z.string().min(1).optional(),
@@ -173,6 +176,9 @@ const isAbortError = (error: unknown) =>
 
 const truncate = (value: string, maximumCharacters: number) =>
   Array.from(value.trim()).slice(0, maximumCharacters).join("");
+
+const firstNonEmpty = (...values: Array<string | undefined>) =>
+  values.find((value) => value?.trim().length);
 
 const stableEvidenceId = (input: KnowledgeSearchRequest, node: BailianNode) => {
   const digest = createHash("sha256")
@@ -449,12 +455,17 @@ export class BailianKnowledgeProvider implements KnowledgeProvider {
     if (node.metadata.pipeline_id !== this.config.knowledgeBaseId) {
       throw new AttemptFailure({ retryable: false });
     }
-    const chunkId = node.metadata._id ?? node.metadata.nid;
+    const chunkId = firstNonEmpty(node.metadata._id, node.metadata.nid);
     if (!chunkId) throw new AttemptFailure({ retryable: false });
 
     const excerpt = truncate(node.metadata.content ?? node.text, 2_000);
     const title = truncate(
-      node.metadata.title ?? node.metadata.hier_title ?? node.metadata.doc_name ?? "知识切片",
+      firstNonEmpty(
+        node.metadata.title,
+        node.metadata.hier_title,
+        node.metadata.doc_name,
+        "知识切片",
+      ) ?? "知识切片",
       500,
     );
     if (!excerpt || !title) throw new AttemptFailure({ retryable: false });

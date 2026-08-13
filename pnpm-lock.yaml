@@ -26,6 +26,12 @@ importers:
       '@crm-agent/contracts':
         specifier: workspace:*
         version: link:../../packages/contracts
+      '@crm-agent/knowledge-provider':
+        specifier: workspace:*
+        version: link:../../packages/knowledge-provider
+      '@crm-agent/model-provider':
+        specifier: workspace:*
+        version: link:../../packages/model-provider
       '@crm-agent/quote-engine':
         specifier: workspace:*
         version: link:../../packages/quote-engine

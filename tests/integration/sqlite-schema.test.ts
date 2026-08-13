@@ -60,7 +60,7 @@ describe("SQLite schema, migrations, and seed", () => {
       seedDatabase(database, seedDirectory);
       seedDatabase(database, seedDirectory);
 
-      expect(database.prepare("SELECT COUNT(*) AS count FROM seed_history").get()).toEqual({ count: 1 });
+      expect(database.prepare("SELECT COUNT(*) AS count FROM seed_history").get()).toEqual({ count: 2 });
       expect(database.prepare("SELECT estimated_total_fen FROM quote_versions").get()).toEqual({
         estimated_total_fen: 800000,
       });
